@@ -157,7 +157,21 @@ class AvantioScraper {
         if (clicked) {
           await this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
         } else {
-          throw new Error(`Cannot navigate to ${key}: no avs token, no href link, no onclick handler found.`);
+          // Last resort: try constructing URL with any available avs token
+          // Some modules aren't linked from the dashboard but accept any valid avs
+          log(`No onclick handler, trying URL construction with borrowed avs...`);
+          const anyToken = this.avsTokens.values().next().value;
+          if (anyToken && anyToken.avs) {
+            const constructedUrl = `${AVANTIO_BASE}/index.php?module=${encodeURIComponent(module)}&action=${encodeURIComponent(action)}&avs=${encodeURIComponent(anyToken.avs)}`;
+            await this.page.goto(constructedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            // Check if we got error 6019
+            const resultUrl = this.page.url();
+            if (resultUrl.includes('error=6019')) {
+              log(`Borrowed avs failed (6019). Module ${module} may not be accessible from current context.`);
+            }
+          } else {
+            throw new Error(`Cannot navigate to ${key}: no avs token, no href link, no onclick handler found.`);
+          }
         }
       }
     }
@@ -284,13 +298,28 @@ class AvantioScraper {
     log('=== Importing Owners (Propietarios) ===');
     this.status = 'importing';
     await this.navigateToModule('Propietarios', 'ListView');
-    // Owners may use card or table layout — try both
+    await delay(3000);
+
+    // Try all scraping approaches
     await this._scrollToLoadAll();
     let records = await this._scrapeCardsFromPage();
     if (records.length === 0) {
-      log('  No cards found for owners, trying table/list scrape...');
+      log('  No cards, trying shadowRoot...');
+      records = await this._scrapeViaShadowRoot();
+    }
+    if (records.length === 0) {
+      log('  No shadow data, trying table/AJAX...');
       records = await this.extractListData('Propietarios', 93);
     }
+
+    // Ensure avantio_id exists
+    records = records.map((r, i) => {
+      if (!r.avantio_id) {
+        r.avantio_id = r.name || `owner-${Date.now()}-${i}`;
+      }
+      return r;
+    });
+
     await this._postToLaravel('owners', records);
     this.importResults.owners = records.length;
     return records;
@@ -317,12 +346,27 @@ class AvantioScraper {
     log('=== Importing Customers (Compradores) ===');
     this.status = 'importing';
     await this.navigateToModule('Compradores', 'index');
+    await delay(3000);
+
     await this._scrollToLoadAll();
     let records = await this._scrapeCardsFromPage();
     if (records.length === 0) {
-      log('  No cards found for customers, trying table/AJAX scrape...');
+      log('  No cards, trying shadowRoot...');
+      records = await this._scrapeViaShadowRoot();
+    }
+    if (records.length === 0) {
+      log('  No shadow data, trying table/AJAX...');
       records = await this.extractListData('Compradores');
     }
+
+    // Ensure avantio_id — use email or name as fallback
+    records = records.map((r, i) => {
+      if (!r.avantio_id) {
+        r.avantio_id = r.email || r.name || `customer-${Date.now()}-${i}`;
+      }
+      return r;
+    });
+
     await this._postToLaravel('customers', records);
     this.importResults.customers = records.length;
     return records;
@@ -375,12 +419,27 @@ class AvantioScraper {
     log('=== Importing Tasks (CompromisosExtras) ===');
     this.status = 'importing';
     await this.navigateToModule('CompromisosExtras', 'ListView');
+    await delay(3000);
+
     await this._scrollToLoadAll();
     let records = await this._scrapeCardsFromPage();
     if (records.length === 0) {
-      log('  No cards found for tasks, trying table/AJAX scrape...');
+      log('  No cards, trying shadowRoot...');
+      records = await this._scrapeViaShadowRoot();
+    }
+    if (records.length === 0) {
+      log('  No shadow data, trying table/AJAX...');
       records = await this.extractListData('CompromisosExtras');
     }
+
+    // Ensure avantio_id
+    records = records.map((r, i) => {
+      if (!r.avantio_id) {
+        r.avantio_id = `task-${Date.now()}-${i}`;
+      }
+      return r;
+    });
+
     await this._postToLaravel('tasks', records);
     this.importResults.tasks = records.length;
     return records;
