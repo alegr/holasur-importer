@@ -173,6 +173,42 @@ app.post('/import/:sessionId/run', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /import/:sessionId/sync
+// Quick sync — only re-imports properties and bookings.
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/sync', async (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found.' });
+  }
+
+  const currentStatus = session.scraper.status !== 'initialized'
+    ? session.scraper.status
+    : session.status;
+
+  if (currentStatus !== 'logged_in' && currentStatus !== 'done') {
+    return res.status(400).json({
+      error: `Cannot sync: current status is "${currentStatus}". User must be logged in first.`,
+    });
+  }
+
+  res.json({ sessionId, status: 'importing', message: 'Quick sync started.' });
+
+  try {
+    session.status = 'importing';
+    const results = await session.scraper.runQuickSync();
+    session.status = 'done';
+    log(`[${sessionId}] Quick sync finished: ${JSON.stringify(results)}`);
+  } catch (err) {
+    session.status = 'error';
+    session.error = err.message;
+    log(`[${sessionId}] Quick sync error: ${err.message}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /import/:sessionId/scrape
 // Scrape data from the current page using Playwright locators (pierce shadow DOM).
 // ---------------------------------------------------------------------------
