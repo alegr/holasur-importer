@@ -482,6 +482,35 @@ class AvantioScraper {
     return this.importResults;
   }
 
+  /**
+   * Quick sync — only re-imports properties and bookings (most dynamic data).
+   * Uses updateOrCreate on the Laravel side, so existing records are updated.
+   */
+  async runQuickSync() {
+    log('========================================');
+    log('Starting quick sync (properties + bookings)');
+    log('========================================');
+    this.status = 'importing';
+    this.importResults = {};
+
+    try {
+      await this.importProperties();
+      await this.importBookings();
+
+      this.status = 'done';
+      log('========================================');
+      log('Quick sync completed.');
+      log(`Results: ${JSON.stringify(this.importResults)}`);
+      log('========================================');
+    } catch (err) {
+      this.status = 'error';
+      log(`Import failed: ${err.message}`);
+      throw err;
+    }
+
+    return this.importResults;
+  }
+
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
