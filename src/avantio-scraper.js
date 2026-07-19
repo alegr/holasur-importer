@@ -332,13 +332,40 @@ class AvantioScraper {
     log('=== Importing Bookings (Compromisos) ===');
     this.status = 'importing';
     await this.navigateToModule('Compromisos', 'ListView');
-    // Bookings may use a different web component or table layout
+
+    // The dashboard link filters bookings by date/status. We need ALL bookings.
+    // Try to clear filters or expand the date range via the web component.
+    await delay(3000); // Wait for page to render
+
+    // Bookings use avantio-bookings-list web component with shadow DOM
     await this._scrollToLoadAll();
     let records = await this._scrapeCardsFromPage();
     if (records.length === 0) {
-      log('  No cards found for bookings, trying table/AJAX scrape...');
+      log('  No cards found for bookings, trying shadowRoot scrape...');
+      records = await this._scrapeViaShadowRoot();
+    }
+    if (records.length === 0) {
+      log('  No shadowRoot data, trying AJAX/table scrape...');
       records = await this.extractListData('Compromisos');
     }
+
+    // Ensure each record has an avantio_id — use reference if no ID found
+    records = records.map((r, i) => {
+      if (!r.avantio_id && r.reference) {
+        r.avantio_id = r.reference;
+      }
+      if (!r.avantio_id && r.col_5) {
+        // col_5 often contains the reference like LOC-999999
+        const refMatch = (r.col_5 || '').match(/^([A-Z]+-\d+|\d{6,})/);
+        if (refMatch) r.avantio_id = refMatch[1];
+      }
+      if (!r.avantio_id) {
+        // Last resort: generate from index + raw text hash
+        r.avantio_id = `import-${Date.now()}-${i}`;
+      }
+      return r;
+    });
+
     await this._postToLaravel('bookings', records);
     this.importResults.bookings = records.length;
     return records;
@@ -687,7 +714,21 @@ class AvantioScraper {
         if (statusMatch) record.status = statusMatch[1];
 
         const refMatch = text.match(/\b([A-Z]+-\d+|LOC-\d+|\d{6,}-\d+)\b/);
-        if (refMatch) record.reference = refMatch[0];
+        if (refMatch) {
+          record.reference = refMatch[0];
+          // Use reference as avantio_id if no ID found from links
+          if (!record.avantio_id) record.avantio_id = refMatch[0];
+        }
+
+        // Extract guest info
+        const guestMatch = text.match(/(\d+)\s*Adult/i);
+        if (guestMatch) record.adults = parseInt(guestMatch[1]);
+        const childMatch = text.match(/(\d+)\s*Child/i);
+        if (childMatch) record.children = parseInt(childMatch[1]);
+
+        // Extract property name (usually after status, before dates)
+        const propMatch = text.match(/\|([^|]+?)(?:Invoiced|Confirmed|Pre-booking|Cancelled|Paid|Unpaid)/i);
+        if (propMatch) record.property_name = propMatch[1].trim();
 
         records.push(record);
       });
