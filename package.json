@@ -1,0 +1,14 @@
+{
+  "name": "holasur-importer",
+  "version": "1.0.0",
+  "description": "Playwright-based data importer for Avantio VRMS",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "playwright": "^1.48.0"
+  }
+}
