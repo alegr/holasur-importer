@@ -58,19 +58,40 @@ app.post('/import/start', async (req, res) => {
     await page.goto(AVANTIO_URL, { waitUntil: 'domcontentloaded' });
     await new Promise(r => setTimeout(r, 3000));
 
-    // If we ended up on a non-dashboard page (persistent context), force go to dashboard
-    const currentUrl = page.url();
-    if (!currentUrl.includes('module=Home') && !currentUrl.includes('action=Login')) {
-      log(`[${sessionId}] Not on dashboard (${currentUrl.substring(0, 60)}...), navigating to Home...`);
-      // Click the home/logo link if available, or use a known avs token
+    // Ensure we end up on the dashboard — the persistent context may load a stale page
+    const ensureDashboard = async () => {
+      const url = page.url();
+      if (url.includes('module=Home') || url.includes('action=Login')) return;
+
+      log(`[${sessionId}] Not on dashboard (${url.substring(0, 60)}...), forcing Home...`);
+      // Try clicking the home/logo link
       const homeLink = await page.$('a[href*="module=Home"][href*="action=index"]');
       if (homeLink) {
         await homeLink.click();
         await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      } else {
+        // Fallback: reload root URL which should redirect to dashboard
+        await page.goto(`${AVANTIO_URL}/index.php`, { waitUntil: 'domcontentloaded' });
+      }
+    };
+
+    await ensureDashboard();
+
+    // Wait for dashboard to fully render — web components, menus, onclick handlers
+    // load asynchronously and we need them for avs token harvesting
+    log(`[${sessionId}] Waiting for dashboard to fully render...`);
+    const maxWaitMs = 15000;
+    const startTime = Date.now();
+    while (Date.now() - startTime < maxWaitMs) {
+      await new Promise(r => setTimeout(r, 2000));
+      const html = await page.content().catch(() => '');
+      const { extractAvsFromHtml } = require('./utils');
+      const tokens = extractAvsFromHtml(html);
+      if (tokens.size >= 10) {
+        log(`[${sessionId}] Dashboard loaded with ${tokens.size} avs tokens.`);
+        break;
       }
     }
-    // Give the dashboard time to fully render (web components, menus, widgets)
-    await new Promise(r => setTimeout(r, 8000));
 
     // Start watching for login in the background
     scraper.waitForLogin().then((loggedIn) => {
