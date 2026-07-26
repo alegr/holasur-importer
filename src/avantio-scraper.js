@@ -3,7 +3,17 @@ const { parseAvantioResponse, extractAvsFromHtml, delay, log } = require('./util
 const LARAVEL_API = 'http://localhost:8001/api/import';
 const AVANTIO_BASE = 'https://app.avantio.pro';
 const PAGE_SIZE = 30;
-const NAV_DELAY = 2500; // ms between navigations
+
+// Rate limiting config
+const RATE_LIMIT = {
+  minDelay: 2000,       // minimum ms between requests
+  maxDelay: 5000,       // maximum ms between requests
+  scrollDelay: 2000,    // ms between scroll actions
+  detailDelay: 3000,    // ms between detail page opens
+  maxRequestsPerSession: 200, // hard cap per session
+  backoffBase: 5000,    // base backoff on error (doubles each retry)
+  maxRetries: 3,        // max retries per action
+};
 
 class AvantioScraper {
   /**
@@ -14,6 +24,51 @@ class AvantioScraper {
     this.avsTokens = new Map();
     this.status = 'initialized';
     this.importResults = {};
+    this.requestCount = 0;
+  }
+
+  /**
+   * Randomized delay between min and max to appear more human-like.
+   */
+  async _rateLimitedDelay(type = 'nav') {
+    const delays = {
+      nav: [RATE_LIMIT.minDelay, RATE_LIMIT.maxDelay],
+      scroll: [RATE_LIMIT.scrollDelay, RATE_LIMIT.scrollDelay + 1000],
+      detail: [RATE_LIMIT.detailDelay, RATE_LIMIT.detailDelay + 2000],
+    };
+    const [min, max] = delays[type] || delays.nav;
+    const ms = min + Math.floor(Math.random() * (max - min));
+    await delay(ms);
+  }
+
+  /**
+   * Check if we've hit the request limit for this session.
+   */
+  _checkRequestLimit() {
+    this.requestCount++;
+    if (this.requestCount > RATE_LIMIT.maxRequestsPerSession) {
+      throw new Error(`Session request limit reached (${RATE_LIMIT.maxRequestsPerSession}). Start a new session.`);
+    }
+    if (this.requestCount % 20 === 0) {
+      log(`  [Rate] ${this.requestCount} requests this session.`);
+    }
+  }
+
+  /**
+   * Retry an async action with exponential backoff.
+   */
+  async _withRetry(actionName, fn) {
+    for (let attempt = 1; attempt <= RATE_LIMIT.maxRetries; attempt++) {
+      try {
+        this._checkRequestLimit();
+        return await fn();
+      } catch (err) {
+        if (attempt === RATE_LIMIT.maxRetries) throw err;
+        const backoff = RATE_LIMIT.backoffBase * Math.pow(2, attempt - 1);
+        log(`  [Retry] ${actionName} failed (attempt ${attempt}/${RATE_LIMIT.maxRetries}), waiting ${backoff}ms: ${err.message.substring(0, 80)}`);
+        await delay(backoff);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -193,7 +248,7 @@ class AvantioScraper {
 
     // Re-harvest tokens from the new page
     await this.harvestAvs();
-    await delay(NAV_DELAY);
+    await this._rateLimitedDelay('nav');
     log(`Arrived at ${this.page.url()}`);
   }
 
@@ -268,7 +323,7 @@ class AvantioScraper {
       }
 
       currentPage++;
-      await delay(NAV_DELAY);
+      await this._rateLimitedDelay('nav');
     }
 
     log(`Finished extracting ${module}: ${allRecords.length} total records.`);
