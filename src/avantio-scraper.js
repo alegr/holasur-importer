@@ -1,6 +1,9 @@
 const { parseAvantioResponse, extractAvsFromHtml, delay, log } = require('./utils');
 
+const crypto = require('crypto');
+
 const LARAVEL_API = 'http://localhost:8001/api/import';
+const LARAVEL_API_BASE = 'http://localhost:8001/api';
 const AVANTIO_BASE = 'https://app.avantio.pro';
 const PAGE_SIZE = 30;
 
@@ -1046,6 +1049,64 @@ class AvantioScraper {
       this.importResults[`${entityType}_detail`] = 1;
     }
     return detail;
+  }
+
+  /**
+   * Compute a short hash of text for change detection.
+   */
+  _hash(text) {
+    return crypto.createHash('md5').update(text || '').digest('hex').substring(0, 12);
+  }
+
+  /**
+   * Fetch existing records from our DB to diff against scraped data.
+   * Returns a Map of avantio_id → { hash } for quick lookup.
+   */
+  async _fetchExistingRecords(entity) {
+    try {
+      const res = await fetch(`${LARAVEL_API_BASE}/${entity}`);
+      if (!res.ok) return new Map();
+      const body = await res.json();
+      const records = body.data || body || [];
+      const map = new Map();
+      for (const r of records) {
+        const hash = r.raw_data?._listHash || '';
+        map.set(String(r.avantio_id), { hash, id: r.id });
+      }
+      log(`  [Diff] Fetched ${map.size} existing ${entity} from DB.`);
+      return map;
+    } catch (err) {
+      log(`  [Diff] Could not fetch existing ${entity}: ${err.message}`);
+      return new Map();
+    }
+  }
+
+  /**
+   * Diff scraped records against DB to find new/changed items.
+   * Adds _listHash to each record for future comparison.
+   * Returns { newRecords, changedRecords, unchangedCount }.
+   */
+  _diffRecords(scraped, existing) {
+    const newRecords = [];
+    const changedRecords = [];
+    let unchangedCount = 0;
+
+    for (const record of scraped) {
+      const id = String(record.avantio_id || '');
+      const hash = this._hash(record._rawText);
+      record._listHash = hash;
+
+      if (!id || !existing.has(id)) {
+        newRecords.push(record);
+      } else if (existing.get(id).hash !== hash) {
+        changedRecords.push(record);
+      } else {
+        unchangedCount++;
+      }
+    }
+
+    log(`  [Diff] New: ${newRecords.length}, Changed: ${changedRecords.length}, Unchanged: ${unchangedCount}`);
+    return { newRecords, changedRecords, unchangedCount };
   }
 
   /**
