@@ -937,6 +937,118 @@ class AvantioScraper {
   }
 
   /**
+   * Scrape detail page for a property or booking.
+   * Opens "See" in a new tab, extracts all input fields + table data, closes tab.
+   */
+  async scrapeDetailPage(entityType, rowIndex) {
+    const wcSelector = entityType === 'property' ? 'avantio-accommodations-list' : 'avantio-bookings-list';
+
+    const clicked = await this.page.evaluate(({ wcSel, idx }) => {
+      const wc = document.querySelector(wcSel);
+      if (!wc || !wc.shadowRoot) return false;
+      const items = wcSel.includes('accommodations')
+        ? wc.shadowRoot.querySelectorAll('.alib-vertical-card')
+        : wc.shadowRoot.querySelectorAll('[data-testid="row-list"]');
+      if (idx >= items.length) return false;
+      const btn = items[idx].querySelector('button[aria-label="See"]');
+      if (btn) { btn.click(); return true; }
+      return false;
+    }, { wcSel: wcSelector, idx: rowIndex });
+
+    if (!clicked) { log(`  No See button on ${entityType} row ${rowIndex}`); return null; }
+
+    // Wait for new tab to appear — may take a few seconds
+    let detailPage = null;
+    for (let i = 0; i < 10; i++) {
+      await delay(1000);
+      const pages = this.page.context().pages();
+      if (pages.length >= 2) {
+        detailPage = pages[pages.length - 1];
+        break;
+      }
+    }
+    if (!detailPage) { log(`  No new tab for ${entityType} row ${rowIndex}`); return null; }
+
+    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    log(`  Detail tab opened: ${detailPage.url().substring(0, 100)}`);
+    // Wait for AJAX content to load (booking details load async)
+    await delay(8000);
+
+    try {
+      const data = await detailPage.evaluate(() => {
+        const result = {};
+        document.querySelectorAll('input[id], select[id]').forEach(el => {
+          if (el.value && el.id && !el.id.startsWith('checkbox')) result[el.id] = el.value;
+        });
+        document.querySelectorAll('table tr').forEach(tr => {
+          const cells = tr.querySelectorAll('td');
+          if (cells.length >= 2) {
+            const label = cells[0].textContent.trim().replace(/\s+/g, ' ').replace(/:+$/, '');
+            const value = cells[1].textContent.trim().replace(/\s+/g, ' ');
+            if (label && value && label.length < 50 && value.length < 300 && value !== label)
+              result['_t_' + label] = value;
+          }
+        });
+        return result;
+      });
+
+      const url = detailPage.url();
+      const m = url.match(/record=(\d+)/);
+      if (m) data._recordId = m[1];
+      log(`  Detail ${entityType} #${rowIndex}: ${Object.keys(data).length} fields (record=${data._recordId || '?'})`);
+      return data;
+    } finally {
+      await detailPage.close().catch(() => {});
+    }
+  }
+
+  /**
+   * Import detail for ONE item to validate before full import.
+   */
+  async importOneDetail(entityType) {
+    log(`=== Scraping detail for first ${entityType} ===`);
+
+    if (entityType === 'properties') {
+      await this.navigateToModule('Propiedades', 'ListViewPropiedades');
+    } else {
+      // Get the bookings menu URL and navigate via page.goto (more reliable)
+      const bookingsUrl = await this.page.evaluate(() => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) {
+            return a.href;
+          }
+        }
+        return null;
+      });
+      if (bookingsUrl) {
+        await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
+    }
+
+    // Wait for the web component to render rows
+    log(`  Waiting for ${entityType} list to load...`);
+    const wcSel = entityType === 'properties' ? 'avantio-accommodations-list' : 'avantio-bookings-list';
+    const rowSel = entityType === 'properties' ? '.alib-vertical-card' : '[data-testid="row-list"]';
+    for (let i = 0; i < 15; i++) {
+      await delay(2000);
+      const count = await this.page.evaluate(({ wc, rs }) => {
+        const el = document.querySelector(wc);
+        return el && el.shadowRoot ? el.shadowRoot.querySelectorAll(rs).length : 0;
+      }, { wc: wcSel, rs: rowSel }).catch(() => 0);
+      if (count > 0) { log(`  ${count} items loaded.`); break; }
+    }
+
+    const detail = await this.scrapeDetailPage(entityType === 'properties' ? 'property' : 'booking', 0);
+    if (detail) {
+      await this._postToLaravel(entityType, [{ avantio_id: detail._recordId || `detail-${Date.now()}`, raw_data: detail }]);
+      this.importResults[`${entityType}_detail`] = 1;
+    }
+    return detail;
+  }
+
+  /**
    * Clear filters on the bookings page to show all bookings.
    * The dashboard link navigates with date/status filters. We need to remove them.
    */

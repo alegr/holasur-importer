@@ -551,6 +551,23 @@ app.post('/import/:sessionId/debug', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /import/:sessionId/detail/:entity
+// Scrape detail page for ONE item (to validate before full import).
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/detail/:entity', async (req, res) => {
+  const { sessionId, entity } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+
+  try {
+    const detail = await session.scraper.importOneDetail(entity);
+    res.json({ entity, detail, status: detail ? 'done' : 'no_data' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // POST /import/:sessionId/scrape-and-save/:entity
 // Scrape the current page and POST to Laravel. No navigation.
 // ---------------------------------------------------------------------------
@@ -583,6 +600,18 @@ app.post('/import/:sessionId/scrape-and-save/:entity', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /import/:sessionId/pages
+// List all open pages/tabs in the browser context.
+// ---------------------------------------------------------------------------
+app.get('/import/:sessionId/pages', async (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  const pages = session.context.pages();
+  res.json({ count: pages.length, pages: pages.map((p, i) => ({ index: i, url: p.url().substring(0, 150), title: '' })) });
+});
+
+// ---------------------------------------------------------------------------
 // POST /import/:sessionId/eval
 // Run arbitrary JS in the page for debugging. Body: { code: "..." }
 // ---------------------------------------------------------------------------
@@ -591,7 +620,10 @@ app.post('/import/:sessionId/eval', async (req, res) => {
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
   try {
-    const result = await session.page.evaluate(new Function('return (' + req.body.code + ')()'));
+    const tabIndex = req.body.tab || 0;
+    const pages = session.context.pages();
+    const page = pages[tabIndex] || session.page;
+    const result = await page.evaluate(new Function('return (' + req.body.code + ')()'));
     res.json({ result });
   } catch (err) {
     res.status(500).json({ error: err.message });
