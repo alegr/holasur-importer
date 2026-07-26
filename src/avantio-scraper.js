@@ -390,23 +390,69 @@ class AvantioScraper {
   async importBookings() {
     log('=== Importing Bookings (Compromisos) ===');
     this.status = 'importing';
-    await this.navigateToModule('Compromisos', 'ListView');
 
-    // The dashboard link filters bookings by date/status. We need ALL bookings.
-    // Try to clear filters or expand the date range via the web component.
-    await delay(3000); // Wait for page to render
+    // Navigate via the sidebar menu "Bookings" link which goes to the unfiltered view
+    // (action=index), NOT the dashboard link which has date/status filters baked in
+    log('  Navigating via sidebar menu to unfiltered bookings...');
+    const navigated = await this.page.evaluate(() => {
+      const menu = document.querySelector('avantio-menu');
+      if (!menu || !menu.shadowRoot) return false;
+      const links = menu.shadowRoot.querySelectorAll('a');
+      for (const a of links) {
+        if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) {
+          window.location.href = a.href;
+          return true;
+        }
+      }
+      return false;
+    });
 
-    // Bookings use avantio-bookings-list web component with shadow DOM
-    await this._scrollToLoadAll();
-    let records = await this._scrapeCardsFromPage();
-    if (records.length === 0) {
-      log('  No cards found for bookings, trying shadowRoot scrape...');
-      records = await this._scrapeViaShadowRoot();
+    if (navigated) {
+      await this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await delay(5000);
+      log(`  Arrived at ${this.page.url().substring(0, 80)}`);
+    } else {
+      log('  Menu link not found, falling back to dashboard link...');
+      await this.navigateToModule('Compromisos', 'ListView');
+      await delay(5000);
+      await this._clearBookingFilters();
+      await delay(5000);
     }
-    if (records.length === 0) {
-      log('  No shadowRoot data, trying AJAX/table scrape...');
-      records = await this.extractListData('Compromisos');
+
+    // Bookings use avantio-bookings-list with shadow DOM + infinite scroll.
+    // Scroll the page body to trigger lazy loading, count shadow DOM rows.
+    log('  Scrolling to load all booking rows...');
+    let prevRowCount = 0;
+    let stableCount = 0;
+    for (let i = 0; i < 30; i++) {
+      await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await delay(2000);
+
+      const rowCount = await this.page.evaluate(() => {
+        const wc = document.querySelector('avantio-bookings-list');
+        if (!wc || !wc.shadowRoot) return 0;
+        return wc.shadowRoot.querySelectorAll('[data-testid="row-list"]').length;
+      }).catch(() => 0);
+
+      if (i % 5 === 0 || rowCount !== prevRowCount) {
+        log(`  Scroll ${i + 1}: ${rowCount} booking rows`);
+      }
+
+      if (rowCount === prevRowCount) {
+        stableCount++;
+        if (stableCount >= 4) {
+          log(`  All rows loaded: ${rowCount}`);
+          break;
+        }
+      } else {
+        stableCount = 0;
+      }
+      prevRowCount = rowCount;
     }
+
+    // Scrape from the fully-loaded shadow DOM
+    let records = await this._scrapeViaShadowRoot();
+    log(`  Scraped ${records.length} booking records.`);
 
     // Ensure each record has an avantio_id — use reference if no ID found
     records = records.map((r, i) => {
@@ -753,85 +799,80 @@ class AvantioScraper {
       if (!shadow) return [];
 
       const records = [];
-      // Look for row elements inside the shadow DOM
-      const rowSelectors = [
-        '[class*="row-list"]',
-        '[class*="row"][class*="item"]',
-        '[role="row"]',
-        'tr',
-        '[class*="card"]',
-        '[data-testid*="row"]',
-        '[data-testid*="item"]',
-      ];
-
-      let rows = [];
-      for (const sel of rowSelectors) {
-        const found = shadow.querySelectorAll(sel);
-        if (found.length > 0) {
-          rows = found;
-          break;
+      // Use data-testid="row-list" which reliably identifies booking rows
+      let rows = shadow.querySelectorAll('[data-testid="row-list"]');
+      if (rows.length === 0) {
+        // Fallback for other entity types
+        for (const sel of ['[role="row"]', 'tr', '[class*="row-list"]']) {
+          const found = shadow.querySelectorAll(sel);
+          if (found.length > 0) { rows = found; break; }
         }
       }
+
+      const months = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
 
       rows.forEach(row => {
         const text = row.textContent.trim();
         if (!text || text.length < 10) return;
-        // Skip header rows
-        if (/^(Booking|Status|Reference|Guest|Date|Amount|Property)\b/i.test(text) && text.length < 100) return;
 
         const record = { _rawText: text.substring(0, 400) };
 
-        // Extract from cells/columns
-        const cells = row.querySelectorAll('td, [class*="cell"], [class*="col"]');
-        cells.forEach((cell, i) => {
-          const t = cell.textContent.trim();
-          if (t) record[`col_${i}`] = t;
-        });
-
-        // Extract links for IDs
-        const links = row.querySelectorAll('a[href]');
+        // Extract avantio_id from links (most reliable)
+        const links = row.querySelectorAll('a[href], button[data-testid="link"]');
         links.forEach(a => {
           const href = a.getAttribute('href') || '';
-          const recordMatch = href.match(/record=(\d+)/);
-          if (recordMatch) record.avantio_id = recordMatch[1];
+          const m = href.match(/record=(\d+)/);
+          if (m) record.avantio_id = m[1];
+          // First link text is usually the property name
+          const t = a.textContent.trim();
+          if (t && !record.property_name) record.property_name = t;
         });
 
-        // Extract data attributes
-        for (const attr of row.attributes || []) {
-          if (attr.name.startsWith('data-')) {
-            record[attr.name] = attr.value;
-          }
+        // Extract cells by index — Avantio booking rows have a consistent structure:
+        // c2/c3: dates + property | c4: status | c5/c6: reference | c7/c8: guest | c9: alerts | c10: amount
+        const cells = row.querySelectorAll('[class*="cell"], [class*="col"], td');
+        const cellTexts = [];
+        cells.forEach(c => cellTexts.push(c.textContent.trim()));
+
+        // Parse dates from text (format: "Aug 10 2026 - Aug 16 2026")
+        const mmmMatch = text.match(/([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{4})\s*-\s*([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{4})/);
+        if (mmmMatch) {
+          const m1 = months[mmmMatch[1]] || '01';
+          const m2 = months[mmmMatch[4]] || '01';
+          record.check_in = `${mmmMatch[3]}-${m1}-${mmmMatch[2].padStart(2,'0')}`;
+          record.check_out = `${mmmMatch[6]}-${m2}-${mmmMatch[5].padStart(2,'0')}`;
+        }
+        // Fallback: ISO format
+        const isoMatch = text.match(/(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})/);
+        if (!record.check_in && isoMatch) {
+          record.check_in = isoMatch[1];
+          record.check_out = isoMatch[2];
         }
 
-        // Try to parse common patterns from text
-        const dateMatch = text.match(/(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})/);
-        if (dateMatch) {
-          record.check_in = dateMatch[1];
-          record.check_out = dateMatch[2];
-        }
-
-        const amountMatch = text.match(/[\d,.]+\s*[€$£]/);
-        if (amountMatch) record.amount = amountMatch[0];
-
-        const statusMatch = text.match(/\b(Confirmed|Pre-booking|Invoiced|Cancelled|Paid|Unpaid|Not Available|Owner Booking)\b/i);
+        // Status — look for known booking statuses
+        const statusMatch = text.match(/\b(Confirmed|Information Request|Pre-booking|Invoiced|Cancelled|Paid|Unpaid|Not Available|Owner Booking|Owner Block)\b/i);
         if (statusMatch) record.status = statusMatch[1];
 
-        const refMatch = text.match(/\b([A-Z]+-\d+|LOC-\d+|\d{6,}-\d+)\b/);
-        if (refMatch) {
-          record.reference = refMatch[0];
-          // Use reference as avantio_id if no ID found from links
-          if (!record.avantio_id) record.avantio_id = refMatch[0];
+        // Reference — alphanumeric patterns like "A203-HMXM2WCJYN" or "33374878-1744214528"
+        const refMatch = text.match(/\b([A-Z]\d+-[A-Z0-9]+|\d{7,}-\d+)\b/);
+        if (refMatch) record.reference = refMatch[0];
+        if (!record.avantio_id && record.reference) record.avantio_id = record.reference;
+
+        // Amount — "US$ 550.16" or "550,16€"
+        const amountMatch = text.match(/(?:US?\$|€|£)\s*([\d,.]+)|([\d,.]+)\s*[€$£]/);
+        if (amountMatch) {
+          record.amount = (amountMatch[1] || amountMatch[2]).replace(/,/g, '');
         }
 
-        // Extract guest info
-        const guestMatch = text.match(/(\d+)\s*Adult/i);
-        if (guestMatch) record.adults = parseInt(guestMatch[1]);
+        // Guest info
+        const adultMatch = text.match(/(\d+)\s*Adult/i);
+        if (adultMatch) record.adults = parseInt(adultMatch[1]);
         const childMatch = text.match(/(\d+)\s*Child/i);
         if (childMatch) record.children = parseInt(childMatch[1]);
 
-        // Extract property name (usually after status, before dates)
-        const propMatch = text.match(/\|([^|]+?)(?:Invoiced|Confirmed|Pre-booking|Cancelled|Paid|Unpaid)/i);
-        if (propMatch) record.property_name = propMatch[1].trim();
+        // Guest name — pattern: "Name - CC" where CC is country code
+        const guestMatch = text.match(/([A-ZÀ-Ú][a-zà-ú]+(?: [A-ZÀ-Ú][a-zà-ú]+)*)\s*-\s*[A-Z]{2}\d/);
+        if (guestMatch) record.guest_name = guestMatch[1];
 
         records.push(record);
       });
@@ -841,21 +882,115 @@ class AvantioScraper {
   }
 
   /**
+   * Clear filters on the bookings page to show all bookings.
+   * The dashboard link navigates with date/status filters. We need to remove them.
+   */
+  async _clearBookingFilters() {
+    try {
+      // Strategy 1: Look for a "clear filters" or "reset" button in the shadow DOM
+      const cleared = await this.page.evaluate(() => {
+        const wc = document.querySelector('avantio-bookings-list');
+        if (!wc || !wc.shadowRoot) return false;
+        const shadow = wc.shadowRoot;
+
+        // Look for clear/reset buttons
+        const buttons = shadow.querySelectorAll('button, a, [role="button"]');
+        for (const btn of buttons) {
+          const text = btn.textContent.trim().toLowerCase();
+          if (text.includes('clear') || text.includes('reset') || text.includes('limpiar') ||
+              text.includes('borrar filtro') || text.includes('all') || text.includes('todos')) {
+            btn.click();
+            return true;
+          }
+        }
+
+        // Look for a "select all" date range option
+        const selects = shadow.querySelectorAll('select');
+        for (const sel of selects) {
+          for (const opt of sel.options) {
+            if (opt.value === '' || opt.text.toLowerCase().includes('todo') || opt.text.toLowerCase().includes('all')) {
+              sel.value = opt.value;
+              sel.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            }
+          }
+        }
+
+        return false;
+      });
+
+      if (cleared) {
+        log('  Filters cleared via shadow DOM controls.');
+        return;
+      }
+
+      // Strategy 2: Navigate to bookings index without filters using URL manipulation
+      // Try module=Compromisos&action=index (the main bookings page without filters)
+      log('  No filter controls found. Trying direct navigation to unfiltered listing...');
+
+      // Look for a menu link to the main bookings page (not the filtered dashboard link)
+      const clicked = await this.page.evaluate(() => {
+        // Check onclick handlers for an unfiltered bookings link
+        const elements = document.querySelectorAll('[onclick*="redireccion"]');
+        for (const el of elements) {
+          const onclick = el.getAttribute('onclick') || '';
+          if (onclick.includes('module=Compromisos') &&
+              (onclick.includes('action=index') || onclick.includes('action=ListView')) &&
+              !onclick.includes('fechaInicio')) {
+            el.click();
+            return true;
+          }
+        }
+        // Check href links
+        const links = document.querySelectorAll('a[href*="module=Compromisos"]');
+        for (const a of links) {
+          const href = a.getAttribute('href') || '';
+          if (href.includes('action=index') && !href.includes('fechaInicio')) {
+            a.click();
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (clicked) {
+        await this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        log('  Navigated to unfiltered bookings page.');
+      } else {
+        log('  WARNING: Could not clear filters. Import may be incomplete.');
+      }
+    } catch (err) {
+      log(`  Error clearing filters: ${err.message}`);
+    }
+  }
+
+  /**
    * Scroll down repeatedly to trigger infinite scroll / lazy loading.
    * Keeps scrolling until no new cards appear.
    */
   async _scrollToLoadAll() {
     let previousCount = 0;
     let stableRounds = 0;
-    const maxScrolls = 20;
+    const maxScrolls = 30;
 
     for (let i = 0; i < maxScrolls; i++) {
-      // Count all possible item types
+      // Count items: Playwright locators + shadow DOM rows
       let cardCount = 0;
-      for (const sel of ['.alib-vertical-card', '.alib-row-list__item', '.alib-horizontal-card', '.alib-list-item', '[data-testid="row"]']) {
+      for (const sel of ['.alib-vertical-card', '.alib-row-list__item', '.alib-horizontal-card', '.alib-list-item', '[data-testid="row"]', '[data-testid="row-list"]']) {
         const c = await this.page.locator(sel).count().catch(() => 0);
         if (c > cardCount) cardCount = c;
       }
+      // Also check shadow DOM row count
+      const shadowCount = await this.page.evaluate(() => {
+        for (const sel of ['avantio-bookings-list', 'avantio-accommodations-list']) {
+          const wc = document.querySelector(sel);
+          if (wc && wc.shadowRoot) {
+            return wc.shadowRoot.querySelectorAll('[data-testid="row-list"], [role="row"], tr').length;
+          }
+        }
+        return 0;
+      }).catch(() => 0);
+      if (shadowCount > cardCount) cardCount = shadowCount;
       log(`  Scroll ${i + 1}: ${cardCount} cards visible`);
 
       if (cardCount === previousCount) {
