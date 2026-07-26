@@ -56,11 +56,16 @@ app.post('/import/start', async (req, res) => {
       sessions.delete(oldId);
     }
 
-    // Use persistent context to preserve cookies/session across restarts
-    const userDataDir = '/tmp/holasur-browser-data';
+    // Persistent user data in home directory (NOT /tmp — survives restarts)
+    const os = require('os');
+    const path = require('path');
+    const userDataDir = path.join(os.homedir(), '.holasur-browser');
 
-    // Clear stale lock files that prevent launch
+    // Ensure directory exists and clear stale lock files
     const fs = require('fs');
+    if (!fs.existsSync(userDataDir)) {
+      fs.mkdirSync(userDataDir, { recursive: true });
+    }
     const lockFile = `${userDataDir}/SingletonLock`;
     if (fs.existsSync(lockFile)) {
       log('Removing stale browser lock file...');
@@ -69,11 +74,17 @@ app.post('/import/start', async (req, res) => {
 
     const context = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
-      args: ['--window-size=900,700', '--window-position=100,100'],
+      args: [
+        '--window-size=900,700',
+        '--window-position=100,100',
+        // Use the profile directory for password storage (not mock keychain)
+        '--password-store=basic',
+        '--enable-features=PasswordManager,PasswordManagerOnboarding',
+      ],
       viewport: { width: 880, height: 650 },
       acceptDownloads: false,
     });
-    const browser = context; // persistent context acts as both browser and context
+    const browser = context;
 
     const page = context.pages()[0] || await context.newPage();
     const scraper = new AvantioScraper(page);
@@ -87,48 +98,76 @@ app.post('/import/start', async (req, res) => {
       error: null,
     });
 
-    // Clear cookies to avoid stale session errors, then navigate to root
-    await context.clearCookies();
+    // Navigate to Avantio and wait for ALL redirects to finish
     log(`[${sessionId}] Navigating to ${AVANTIO_URL}...`);
     await page.goto(AVANTIO_URL, { waitUntil: 'load', timeout: 30000 });
+    // Wait for any JS-based redirects to complete
+    await new Promise(r => setTimeout(r, 3000));
+    // If a redirect happened, wait for that page too
+    await page.waitForLoadState('load').catch(() => {});
     await new Promise(r => setTimeout(r, 2000));
 
-    // If we hit an error page, retry once
-    const pageText = await page.textContent('body').catch(() => '');
-    if (pageText.includes('registry number') || pageText.includes('not possible to connect')) {
-      log(`[${sessionId}] Avantio error page detected, retrying...`);
-      await page.goto(AVANTIO_URL, { waitUntil: 'load', timeout: 30000 });
-      await new Promise(r => setTimeout(r, 2000));
-    }
+    const finalUrl = page.url();
+    log(`[${sessionId}] Settled on: ${finalUrl.substring(0, 80)}`);
 
-    // If already logged in (redirected to dashboard)
-    if (page.url().includes('module=Home')) {
+    // Check the actual page content, not just URL — the URL can have misleading params
+    const isOnDashboard = await page.evaluate(() => {
+      // Dashboard has the avantio-menu web component and module=Home in the actual module param
+      const url = new URL(window.location.href);
+      const module = url.searchParams.get('module');
+      return module === 'Home' || !!document.querySelector('avantio-menu');
+    }).catch(() => false);
+
+    if (isOnDashboard) {
       log(`[${sessionId}] Already logged in, on dashboard.`);
-    }
-
-    // Wait for dashboard to fully render — web components, menus, onclick handlers
-    // load asynchronously and we need them for avs token harvesting
-    log(`[${sessionId}] Waiting for dashboard to fully render...`);
-    const maxWaitMs = 15000;
-    const startTime = Date.now();
-    while (Date.now() - startTime < maxWaitMs) {
-      await new Promise(r => setTimeout(r, 2000));
-      const html = await page.content().catch(() => '');
-      const { extractAvsFromHtml } = require('./utils');
-      const tokens = extractAvsFromHtml(html);
-      if (tokens.size >= 10) {
-        log(`[${sessionId}] Dashboard loaded with ${tokens.size} avs tokens.`);
-        break;
+    } else {
+      // On the login page — wait for form to be stable, click the first input,
+      // and bring the browser window to front
+      log(`[${sessionId}] On login page, waiting for form...`);
+      try {
+        await page.waitForSelector('input', { timeout: 15000, state: 'visible' });
+        // Click the first visible text/email input to focus it
+        const inputs = await page.$$('input:visible');
+        for (const inp of inputs) {
+          const type = await inp.getAttribute('type');
+          if (!type || type === 'text' || type === 'email') {
+            await inp.click();
+            log(`[${sessionId}] Clicked login input (type=${type}).`);
+            break;
+          }
+        }
+        // Bring browser window to front
+        await page.bringToFront();
+      } catch {
+        log(`[${sessionId}] Could not focus login form.`);
       }
     }
 
     // Start watching for login in the background
-    scraper.waitForLogin().then((loggedIn) => {
+    // Dashboard token harvesting happens AFTER login is detected (not before)
+    scraper.waitForLogin().then(async (loggedIn) => {
       const session = sessions.get(sessionId);
-      if (session) {
-        session.status = loggedIn ? 'logged_in' : 'error';
-        if (!loggedIn) session.error = 'Login timed out.';
+      if (!session) return;
+
+      if (!loggedIn) {
+        session.status = 'error';
+        session.error = 'Login timed out.';
+        return;
       }
+
+      // Now that we're logged in, wait for dashboard to fully render
+      log(`[${sessionId}] Logged in, waiting for dashboard tokens...`);
+      const { extractAvsFromHtml } = require('./utils');
+      for (let i = 0; i < 10; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const html = await page.content().catch(() => '');
+        const tokens = extractAvsFromHtml(html);
+        if (tokens.size >= 10) {
+          log(`[${sessionId}] Dashboard ready with ${tokens.size} avs tokens.`);
+          break;
+        }
+      }
+      session.status = 'logged_in';
     });
 
     res.json({ sessionId, status: 'waiting_for_login' });
@@ -552,15 +591,22 @@ app.post('/import/:sessionId/debug', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // POST /import/:sessionId/detail/:entity
-// Scrape detail page for ONE item (to validate before full import).
+// Scrape detail page for a specific record. Body: { avantio_id: "123" }
+// If no avantio_id provided, scrapes first item in the list.
 // ---------------------------------------------------------------------------
 app.post('/import/:sessionId/detail/:entity', async (req, res) => {
   const { sessionId, entity } = req.params;
+  const avantioId = req.body?.avantio_id;
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
 
   try {
-    const detail = await session.scraper.importOneDetail(entity);
+    let detail;
+    if (avantioId) {
+      detail = await session.scraper.scrapeRecordDetail(entity, avantioId);
+    } else {
+      detail = await session.scraper.importOneDetail(entity);
+    }
     res.json({ entity, detail, status: detail ? 'done' : 'no_data' });
   } catch (err) {
     res.status(500).json({ error: err.message });
