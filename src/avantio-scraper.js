@@ -93,10 +93,15 @@ class AvantioScraper {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        const url = this.page.url();
-        // After login Avantio typically redirects to module=Home
-        if (url.includes('module=Home') || url.includes('module=Dashboard')) {
-          log('Login detected via URL.');
+        // Check the actual module= param (not return_module) to avoid false positives
+        const isLoggedIn = await this.page.evaluate(() => {
+          const url = new URL(window.location.href);
+          const module = url.searchParams.get('module');
+          return module === 'Home' || module === 'Dashboard' || !!document.querySelector('avantio-menu');
+        }).catch(() => false);
+
+        if (isLoggedIn) {
+          log('Login detected.');
           this.status = 'logged_in';
           return true;
         }
@@ -960,17 +965,22 @@ class AvantioScraper {
 
     if (!clicked) { log(`  No See button on ${entityType} row ${rowIndex}`); return null; }
 
-    // Wait for new tab to appear — may take a few seconds
+    // Wait for new tab with a DetailView URL
     let detailPage = null;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 15; i++) {
       await delay(1000);
       const pages = this.page.context().pages();
-      if (pages.length >= 2) {
-        detailPage = pages[pages.length - 1];
-        break;
+      // Find the page with DetailView in the URL (not the list page)
+      for (const p of pages) {
+        const url = p.url();
+        if (url.includes('action=DetailView') && url.includes('record=')) {
+          detailPage = p;
+          break;
+        }
       }
+      if (detailPage) break;
     }
-    if (!detailPage) { log(`  No new tab for ${entityType} row ${rowIndex}`); return null; }
+    if (!detailPage) { log(`  No detail tab for ${entityType} row ${rowIndex}`); return null; }
 
     await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
     log(`  Detail tab opened: ${detailPage.url().substring(0, 100)}`);
@@ -1003,6 +1013,187 @@ class AvantioScraper {
     } finally {
       await detailPage.close().catch(() => {});
     }
+  }
+
+  /**
+   * Import detail for ONE item to validate before full import.
+   */
+  /**
+   * Scrape a SPECIFIC record's detail by navigating to its detail page directly.
+   * Opens a new tab with the detail URL, scrapes all fields, saves to Laravel.
+   */
+  async scrapeRecordDetail(entityType, avantioId) {
+    log(`=== Scraping detail for ${entityType} record ${avantioId} ===`);
+
+    const module = entityType === 'properties' ? 'Propiedades' : 'Compromisos';
+
+    // Navigate to the list page first to get a valid session context
+    if (entityType === 'properties') {
+      await this.navigateToModule('Propiedades', 'ListViewPropiedades');
+    } else {
+      const bookingsUrl = await this.page.evaluate(() => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index'))
+            return a.href;
+        }
+        return null;
+      });
+      if (bookingsUrl) {
+        await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
+    }
+    await delay(3000);
+
+    // Find the "See" button for this specific record by searching for its ID in links
+    const wcSelector = entityType === 'properties' ? 'avantio-accommodations-list' : 'avantio-bookings-list';
+
+    // Scroll to load items and find our record
+    log(`  Scrolling to find record ${avantioId}...`);
+    let found = false;
+    for (let scroll = 0; scroll < 25; scroll++) {
+      await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await delay(2000);
+
+      found = await this.page.evaluate(({ wcSel, recId }) => {
+        const wc = document.querySelector(wcSel);
+        if (!wc || !wc.shadowRoot) return false;
+        // Look for a link/button containing record=<id> in href
+        const links = wc.shadowRoot.querySelectorAll('a[href*="record="], button[data-testid="link"]');
+        for (const a of links) {
+          const href = a.getAttribute('href') || '';
+          if (href.includes(`record=${recId}`)) return true;
+        }
+        // Also check for the ID in text content of rows
+        const rows = wc.shadowRoot.querySelectorAll('[data-testid="row-list"], .alib-vertical-card');
+        for (const row of rows) {
+          if (row.textContent.includes(recId)) return true;
+        }
+        return false;
+      }, { wcSel: wcSelector, recId: avantioId });
+
+      if (found) {
+        log(`  Found record ${avantioId} after ${scroll + 1} scrolls.`);
+        break;
+      }
+    }
+
+    if (!found) {
+      log(`  Record ${avantioId} not found in list. Trying direct URL...`);
+      // Fallback: try constructing the detail URL directly
+      // Get any avs token from the current page
+      await this.harvestAvs();
+      const anyToken = this.avsTokens.values().next().value;
+      if (anyToken && anyToken.avs) {
+        const detailUrl = `${AVANTIO_BASE}/index.php?record=${avantioId}&module=${module}&action=DetailView&avs=${encodeURIComponent(anyToken.avs)}`;
+        const newPage = await this.page.context().newPage();
+        await newPage.goto(detailUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+        await delay(8000);
+
+        const data = await this._extractDetailFromPage(newPage);
+        await newPage.close().catch(() => {});
+
+        if (Object.keys(data).length > 0) {
+          const record = this._mapDetailToRecord(entityType, data);
+          await this._postToLaravel(entityType, [record]);
+          return data;
+        }
+      }
+      return null;
+    }
+
+    // Click the "See" button for this specific record
+    const clicked = await this.page.evaluate(({ wcSel, recId }) => {
+      const wc = document.querySelector(wcSel);
+      if (!wc || !wc.shadowRoot) return false;
+
+      // Find the row containing this record
+      const rows = wc.shadowRoot.querySelectorAll('[data-testid="row-list"], .alib-vertical-card');
+      for (const row of rows) {
+        const links = row.querySelectorAll('a[href*="record="]');
+        let isTarget = false;
+        for (const a of links) {
+          if ((a.getAttribute('href') || '').includes(`record=${recId}`)) {
+            isTarget = true;
+            break;
+          }
+        }
+        // Also check by text content
+        if (!isTarget && row.textContent.includes(recId)) isTarget = true;
+
+        if (isTarget) {
+          const seeBtn = row.querySelector('button[aria-label="See"]');
+          if (seeBtn) { seeBtn.click(); return true; }
+        }
+      }
+      return false;
+    }, { wcSel: wcSelector, recId: avantioId });
+
+    if (!clicked) {
+      log(`  Could not click See for record ${avantioId}`);
+      return null;
+    }
+
+    // Wait for detail tab
+    let detailPage = null;
+    for (let i = 0; i < 15; i++) {
+      await delay(1000);
+      const pages = this.page.context().pages();
+      for (const p of pages) {
+        if (p.url().includes('action=DetailView') && p.url().includes('record=')) {
+          detailPage = p;
+          break;
+        }
+      }
+      if (detailPage) break;
+    }
+
+    if (!detailPage) {
+      log(`  No detail tab opened for ${avantioId}`);
+      return null;
+    }
+
+    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    log(`  Detail tab: ${detailPage.url().substring(0, 80)}`);
+    await delay(8000);
+
+    const data = await this._extractDetailFromPage(detailPage);
+    await detailPage.close().catch(() => {});
+
+    if (Object.keys(data).length > 0) {
+      log(`  Extracted ${Object.keys(data).length} fields for ${avantioId}`);
+      const record = this._mapDetailToRecord(entityType, data);
+      await this._postToLaravel(entityType, [record]);
+      return data;
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract all input fields and table data from a detail page.
+   */
+  async _extractDetailFromPage(page) {
+    return page.evaluate(() => {
+      const result = {};
+      document.querySelectorAll('input[id], select[id]').forEach(el => {
+        if (el.value && el.id && !el.id.startsWith('checkbox')) result[el.id] = el.value;
+      });
+      document.querySelectorAll('table tr').forEach(tr => {
+        const cells = tr.querySelectorAll('td');
+        if (cells.length >= 2) {
+          const label = cells[0].textContent.trim().replace(/\s+/g, ' ').replace(/:+$/, '');
+          const value = cells[1].textContent.trim().replace(/\s+/g, ' ');
+          if (label && value && label.length < 50 && value.length < 300 && value !== label)
+            result['_t_' + label] = value;
+        }
+      });
+      const url = window.location.href;
+      const m = url.match(/record=(\d+)/);
+      if (m) result._recordId = m[1];
+      return result;
+    });
   }
 
   /**
@@ -1045,10 +1236,91 @@ class AvantioScraper {
 
     const detail = await this.scrapeDetailPage(entityType === 'properties' ? 'property' : 'booking', 0);
     if (detail) {
-      await this._postToLaravel(entityType, [{ avantio_id: detail._recordId || `detail-${Date.now()}`, raw_data: detail }]);
+      const record = this._mapDetailToRecord(entityType, detail);
+      await this._postToLaravel(entityType, [record]);
       this.importResults[`${entityType}_detail`] = 1;
     }
     return detail;
+  }
+
+  /**
+   * Map scraped detail fields to a record suitable for the Laravel import API.
+   * Known fields go to named columns, everything else to raw_data (detail section).
+   */
+  _mapDetailToRecord(entityType, detail) {
+    const record = {
+      avantio_id: detail._recordId || detail.record || `detail-${Date.now()}`,
+    };
+
+    if (entityType === 'properties') {
+      // Map property detail fields to DB columns
+      if (detail['_t_Address']) record.address = detail['_t_Address'];
+      if (detail['_t_Building/house number']) {
+        record.address = (record.address || '') + ' ' + detail['_t_Building/house number'];
+      }
+      if (detail['_t_Floor']) record.address = (record.address || '') + ', Piso ' + detail['_t_Floor'];
+      if (detail['_t_Apartment / Unit / Suite number']) {
+        record.address = (record.address || '') + ', ' + detail['_t_Apartment / Unit / Suite number'];
+      }
+
+      if (detail['_t_Number of bedrooms']) {
+        record.bedrooms = parseInt(detail['_t_Number of bedrooms']) || null;
+      }
+      if (detail['_t_Square Footage']) {
+        // Convert ft² to m² (1 ft² = 0.0929 m²)
+        const sqft = parseFloat(detail['_t_Square Footage'].replace(/[^0-9.]/g, ''));
+        if (sqft) record.size_m2 = Math.round(sqft * 0.0929 * 100) / 100;
+      }
+      if (detail['_t_Occupation without supplement']) {
+        const match = detail['_t_Occupation without supplement'].match(/(\d+)/);
+        if (match) record.max_guests = parseInt(match[1]);
+      }
+
+      // Count bathrooms from bedroom details (look for "bathroom" mentions)
+      let bathrooms = 0;
+      for (const [k, v] of Object.entries(detail)) {
+        if (k.includes('bathroom') || (typeof v === 'string' && v.toLowerCase().includes('bathroom'))) {
+          bathrooms++;
+        }
+      }
+      if (bathrooms > 0) record.bathrooms = bathrooms;
+
+      // Count beds
+      let beds = 0;
+      for (const [k, v] of Object.entries(detail)) {
+        if (k.startsWith('_t_Bedroom')) {
+          const bedMatch = (v || '').match(/(\d+)x/);
+          if (bedMatch) beds += parseInt(bedMatch[1]);
+          else beds += 1; // "Double bed" = 1 bed
+        }
+      }
+      if (beds > 0) record.beds = beds;
+
+      if (detail['ESTADO_CD']) {
+        const statusMap = { 'DISPONIBLE': 'Active', 'BAJA': 'Deactivated', 'NODISPONIBLE': 'Inactive' };
+        record.status = statusMap[detail['ESTADO_CD']] || detail['ESTADO_CD'];
+      }
+    }
+
+    if (entityType === 'bookings') {
+      if (detail.fechaEntrada) record.check_in = detail.fechaEntrada.split(' ')[0];
+      if (detail.fechaSalida) record.check_out = detail.fechaSalida.split(' ')[0];
+      if (detail.idPropiedad || detail.idAlojamiento) {
+        record.property_avantio_id = detail.idPropiedad || detail.idAlojamiento;
+      }
+      if (detail.amountHiddenCompPop1) record.amount = detail.amountHiddenCompPop1;
+      if (detail['_t_Adults']) record.adults = parseInt(detail['_t_Adults']) || null;
+      if (detail['_t_Children']) record.children = parseInt(detail['_t_Children']) || null;
+
+      // Currency: 840 = USD, 978 = EUR, 032 = ARS
+      const currMap = { '840': 'USD', '978': 'EUR', '032': 'ARS' };
+      if (detail.currencyPago1) record.currency = currMap[detail.currencyPago1] || 'USD';
+    }
+
+    // Store ALL detail fields in raw_data for the frontend to display
+    record._detail = detail;
+
+    return record;
   }
 
   /**
