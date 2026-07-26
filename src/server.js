@@ -23,6 +23,22 @@ const AVANTIO_URL = 'https://app.avantio.pro';
 const sessions = new Map();
 
 // ---------------------------------------------------------------------------
+// GET /import/active
+// Return the current active session if one exists and is usable.
+// ---------------------------------------------------------------------------
+app.get('/import/active', (req, res) => {
+  for (const [sessionId, session] of sessions) {
+    const status = session.scraper.status !== 'initialized'
+      ? session.scraper.status
+      : session.status;
+    if (status === 'logged_in' || status === 'done') {
+      return res.json({ sessionId, status, active: true });
+    }
+  }
+  res.json({ active: false });
+});
+
+// ---------------------------------------------------------------------------
 // POST /import/start
 // Launch a visible Chromium browser and navigate to Avantio login page.
 // ---------------------------------------------------------------------------
@@ -31,8 +47,26 @@ app.post('/import/start', async (req, res) => {
     const sessionId = crypto.randomUUID();
     log(`[${sessionId}] Launching browser...`);
 
+    // Close any existing sessions first — only one browser at a time
+    for (const [oldId, oldSession] of sessions) {
+      try {
+        log(`[${oldId}] Closing previous session...`);
+        await oldSession.browser.close();
+      } catch { /* ignore */ }
+      sessions.delete(oldId);
+    }
+
     // Use persistent context to preserve cookies/session across restarts
     const userDataDir = '/tmp/holasur-browser-data';
+
+    // Clear stale lock files that prevent launch
+    const fs = require('fs');
+    const lockFile = `${userDataDir}/SingletonLock`;
+    if (fs.existsSync(lockFile)) {
+      log('Removing stale browser lock file...');
+      fs.unlinkSync(lockFile);
+    }
+
     const context = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
       args: ['--window-size=900,700', '--window-position=100,100'],
@@ -53,29 +87,24 @@ app.post('/import/start', async (req, res) => {
       error: null,
     });
 
-    // Navigate to the root — it should redirect to dashboard if logged in
+    // Clear cookies to avoid stale session errors, then navigate to root
+    await context.clearCookies();
     log(`[${sessionId}] Navigating to ${AVANTIO_URL}...`);
-    await page.goto(AVANTIO_URL, { waitUntil: 'domcontentloaded' });
-    await new Promise(r => setTimeout(r, 3000));
+    await page.goto(AVANTIO_URL, { waitUntil: 'load', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 2000));
 
-    // Ensure we end up on the dashboard — the persistent context may load a stale page
-    const ensureDashboard = async () => {
-      const url = page.url();
-      if (url.includes('module=Home') || url.includes('action=Login')) return;
+    // If we hit an error page, retry once
+    const pageText = await page.textContent('body').catch(() => '');
+    if (pageText.includes('registry number') || pageText.includes('not possible to connect')) {
+      log(`[${sessionId}] Avantio error page detected, retrying...`);
+      await page.goto(AVANTIO_URL, { waitUntil: 'load', timeout: 30000 });
+      await new Promise(r => setTimeout(r, 2000));
+    }
 
-      log(`[${sessionId}] Not on dashboard (${url.substring(0, 60)}...), forcing Home...`);
-      // Try clicking the home/logo link
-      const homeLink = await page.$('a[href*="module=Home"][href*="action=index"]');
-      if (homeLink) {
-        await homeLink.click();
-        await page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      } else {
-        // Fallback: reload root URL which should redirect to dashboard
-        await page.goto(`${AVANTIO_URL}/index.php`, { waitUntil: 'domcontentloaded' });
-      }
-    };
-
-    await ensureDashboard();
+    // If already logged in (redirected to dashboard)
+    if (page.url().includes('module=Home')) {
+      log(`[${sessionId}] Already logged in, on dashboard.`);
+    }
 
     // Wait for dashboard to fully render — web components, menus, onclick handlers
     // load asynchronously and we need them for avs token harvesting
@@ -516,6 +545,54 @@ app.post('/import/:sessionId/debug', async (req, res) => {
       avsTokens: tokenEntries,
       domAnalysis: pageInfo.domAnalysis,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/:sessionId/scrape-and-save/:entity
+// Scrape the current page and POST to Laravel. No navigation.
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/scrape-and-save/:entity', async (req, res) => {
+  const { sessionId, entity } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+
+  try {
+    const scraper = session.scraper;
+
+    // Scrape from shadow DOM
+    let records = await scraper._scrapeViaShadowRoot();
+    log(`[${sessionId}] Scraped ${records.length} ${entity} records from current page.`);
+
+    // Ensure avantio_id
+    records = records.map((r, i) => {
+      if (!r.avantio_id && r.reference) r.avantio_id = r.reference;
+      if (!r.avantio_id) r.avantio_id = `${entity}-${Date.now()}-${i}`;
+      return r;
+    });
+
+    // POST to Laravel
+    await scraper._postToLaravel(entity, records);
+
+    res.json({ entity, scraped: records.length, status: 'done' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/:sessionId/eval
+// Run arbitrary JS in the page for debugging. Body: { code: "..." }
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/eval', async (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const result = await session.page.evaluate(new Function('return (' + req.body.code + ')()'));
+    res.json({ result });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
