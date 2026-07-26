@@ -176,6 +176,21 @@ class AvantioScraper {
       }
     }
 
+    // Check for 6019 error and retry from dashboard if needed
+    const arrivedUrl = this.page.url();
+    if (arrivedUrl.includes('error=6019')) {
+      log(`Got error 6019, retrying via dashboard...`);
+      await this.page.goto(`${AVANTIO_BASE}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await delay(5000);
+      this.avsTokens.clear();
+      await this.harvestAvs();
+      // Try once more with fresh tokens
+      const retryToken = this.avsTokens.get(key);
+      if (retryToken && retryToken.fullUrl) {
+        await this.page.goto(retryToken.fullUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
+    }
+
     // Re-harvest tokens from the new page
     await this.harvestAvs();
     await delay(NAV_DELAY);

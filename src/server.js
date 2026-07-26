@@ -35,8 +35,8 @@ app.post('/import/start', async (req, res) => {
     const userDataDir = '/tmp/holasur-browser-data';
     const context = await chromium.launchPersistentContext(userDataDir, {
       headless: false,
-      args: ['--start-maximized'],
-      viewport: null,
+      args: ['--window-size=900,700', '--window-position=100,100'],
+      viewport: { width: 880, height: 650 },
       acceptDownloads: false,
     });
     const browser = context; // persistent context acts as both browser and context
@@ -169,6 +169,56 @@ app.post('/import/:sessionId/run', async (req, res) => {
     session.status = 'error';
     session.error = err.message;
     log(`[${sessionId}] Import error: ${err.message}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/:sessionId/import/:entity
+// Import a single entity type. Allows importing from within each section.
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/import/:entity', async (req, res) => {
+  const { sessionId, entity } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found.' });
+  }
+
+  const currentStatus = session.scraper.status !== 'initialized'
+    ? session.scraper.status
+    : session.status;
+
+  if (currentStatus !== 'logged_in' && currentStatus !== 'done') {
+    return res.status(400).json({
+      error: `Cannot import: status is "${currentStatus}". Login required.`,
+    });
+  }
+
+  const methods = {
+    properties: () => session.scraper.importProperties(),
+    bookings: () => session.scraper.importBookings(),
+    owners: () => session.scraper.importOwners(),
+    customers: () => session.scraper.importCustomers(),
+    tasks: () => session.scraper.importTasks(),
+  };
+
+  if (!methods[entity]) {
+    return res.status(400).json({ error: `Unknown entity: ${entity}` });
+  }
+
+  res.json({ sessionId, entity, status: 'importing' });
+
+  try {
+    session.status = 'importing';
+    session.scraper.status = 'importing';
+    await methods[entity]();
+    session.status = 'done';
+    session.scraper.status = 'done';
+    log(`[${sessionId}] ${entity} import finished.`);
+  } catch (err) {
+    session.status = 'error';
+    session.error = err.message;
+    log(`[${sessionId}] ${entity} import error: ${err.message}`);
   }
 });
 
