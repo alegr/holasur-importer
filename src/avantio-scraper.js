@@ -1025,113 +1025,165 @@ class AvantioScraper {
   async scrapeRecordDetail(entityType, avantioId) {
     log(`=== Scraping detail for ${entityType} record ${avantioId} ===`);
 
-    const module = entityType === 'properties' ? 'Propiedades' : 'Compromisos';
+    // For properties: avantio_id appears as text in the card (e.g. "671862")
+    // For bookings: avantio_id is only in the See button URL, not in row text/links.
+    //   We must find the row by matching dates+property from our DB.
 
-    // Navigate to the list page first to get a valid session context
+    // Get identifying info from our DB to help find the row
+    let searchText = avantioId;
+    try {
+      const entity = entityType === 'properties' ? 'properties' : 'bookings';
+      const res = await fetch(`${LARAVEL_API.replace('/import', '')}/${entity}?search=${avantioId}`);
+      if (res.ok) {
+        const body = await res.json();
+        const records = body.data || [];
+        const rec = records.find(r => String(r.avantio_id) === String(avantioId));
+        if (rec) {
+          // For bookings, combine property name + check-in date for unique match
+          if (entityType === 'bookings') {
+            const parts = [];
+            if (rec.raw_data?.property_name) parts.push(rec.raw_data.property_name);
+            // Format check_in as "Feb 14 2027" to match Avantio's display
+            if (rec.check_in) {
+              // Parse date string directly (avoid timezone shift from Date constructor)
+              const dateStr = String(rec.check_in).substring(0, 10); // "2027-02-14"
+              const [y, m, day] = dateStr.split('-');
+              const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+              parts.push(`${months[parseInt(m)]} ${parseInt(day)} ${y}`);
+            }
+            if (parts.length > 0) searchText = parts.join('|');
+          }
+        }
+      }
+    } catch { /* use avantioId as fallback */ }
+
+    // Navigate to list
     if (entityType === 'properties') {
       await this.navigateToModule('Propiedades', 'ListViewPropiedades');
     } else {
       const bookingsUrl = await this.page.evaluate(() => {
         const menu = document.querySelector('avantio-menu');
         if (!menu || !menu.shadowRoot) return null;
-        for (const a of menu.shadowRoot.querySelectorAll('a')) {
-          if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index'))
-            return a.href;
-        }
+        for (const a of menu.shadowRoot.querySelectorAll('a'))
+          if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) return a.href;
         return null;
       });
-      if (bookingsUrl) {
-        await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      }
+      if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     }
     await delay(3000);
 
-    // Find the "See" button for this specific record by searching for its ID in links
     const wcSelector = entityType === 'properties' ? 'avantio-accommodations-list' : 'avantio-bookings-list';
+    const rowSelector = entityType === 'properties' ? '.alib-vertical-card' : '[data-testid="row-list"]';
 
-    // Scroll to load items and find our record
-    log(`  Scrolling to find record ${avantioId}...`);
-    let found = false;
-    for (let scroll = 0; scroll < 25; scroll++) {
+    // Try the search box first (faster than scrolling)
+    const searchTerms = [avantioId];
+    // Also add booking reference from our DB if available
+    try {
+      const res = await fetch(`${LARAVEL_API.replace('/import', '')}/bookings?search=${avantioId}`);
+      if (res.ok) {
+        const body = await res.json();
+        const rec = (body.data || []).find(r => String(r.avantio_id) === String(avantioId));
+        if (rec?.raw_data?._rawText) {
+          const refMatch = rec.raw_data._rawText.match(/(\d{7,}-\d+)/);
+          if (refMatch) searchTerms.push(refMatch[1]);
+        }
+      }
+    } catch {}
+
+    for (const term of searchTerms) {
+      log(`  Trying search box for "${term}"...`);
+      try {
+        const searchInput = this.page.locator(`${wcSelector} >> input[placeholder*="Search"]`);
+        if (await searchInput.count() > 0) {
+          await searchInput.fill('');
+          await searchInput.type(term, { delay: 50 });
+          await this.page.keyboard.press('Enter');
+          await delay(4000);
+          // Check if results filtered
+          const count = await this.page.evaluate(({ wc, rs }) => {
+            const el = document.querySelector(wc);
+            return el && el.shadowRoot ? el.shadowRoot.querySelectorAll(rs).length : 0;
+          }, { wc: wcSelector, rs: rowSelector }).catch(() => 0);
+          if (count > 0 && count < 10) {
+            log(`  Search returned ${count} results.`);
+            break;
+          }
+          // Clear search if it didn't filter
+          await searchInput.fill('');
+          await this.page.keyboard.press('Enter');
+          await delay(2000);
+        }
+      } catch { /* fall through to scrolling */ }
+    }
+
+    // Scroll until we find the row or exhaust the list
+    log(`  Scrolling to find "${searchText.substring(0, 40)}"...`);
+    let foundIndex = -1;
+    let prevCount = 0;
+    let stableRounds = 0;
+
+    for (let scroll = 0; scroll < 30; scroll++) {
       await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await delay(2000);
 
-      found = await this.page.evaluate(({ wcSel, recId }) => {
+      const result = await this.page.evaluate(({ wcSel, rSel, search, aId }) => {
         const wc = document.querySelector(wcSel);
-        if (!wc || !wc.shadowRoot) return false;
-        // Look for a link/button containing record=<id> in href
-        const links = wc.shadowRoot.querySelectorAll('a[href*="record="], button[data-testid="link"]');
-        for (const a of links) {
-          const href = a.getAttribute('href') || '';
-          if (href.includes(`record=${recId}`)) return true;
+        if (!wc || !wc.shadowRoot) return { count: 0, found: -1 };
+        const rows = wc.shadowRoot.querySelectorAll(rSel);
+        let found = -1;
+        for (let i = 0; i < rows.length; i++) {
+          const text = rows[i].textContent;
+          // Match by avantio_id in text, or by ALL search parts (prop name + date)
+          const searchParts = search.split('|');
+          const allPartsMatch = searchParts.length > 0 && searchParts.every(p => text.includes(p));
+          if (text.includes(aId) || allPartsMatch) {
+            found = i;
+            break;
+          }
+          // For properties, also check links for record=<id>
+          const links = rows[i].querySelectorAll('a[href]');
+          for (const a of links) {
+            if (a.href.includes(`record=${aId}`)) { found = i; break; }
+          }
+          if (found >= 0) break;
         }
-        // Also check for the ID in text content of rows
-        const rows = wc.shadowRoot.querySelectorAll('[data-testid="row-list"], .alib-vertical-card');
-        for (const row of rows) {
-          if (row.textContent.includes(recId)) return true;
-        }
-        return false;
-      }, { wcSel: wcSelector, recId: avantioId });
+        return { count: rows.length, found };
+      }, { wcSel: wcSelector, rSel: rowSelector, search: searchText, aId: avantioId });
 
-      if (found) {
-        log(`  Found record ${avantioId} after ${scroll + 1} scrolls.`);
+      if (result.found >= 0) {
+        foundIndex = result.found;
+        log(`  Found at row ${foundIndex} after ${scroll + 1} scrolls (${result.count} rows).`);
         break;
       }
+
+      if (result.count === prevCount) {
+        stableRounds++;
+        if (stableRounds >= 4) {
+          log(`  All ${result.count} rows loaded, record not found.`);
+          break;
+        }
+      } else { stableRounds = 0; }
+      prevCount = result.count;
     }
 
-    if (!found) {
-      log(`  Record ${avantioId} not found in list. Trying direct URL...`);
-      // Fallback: try constructing the detail URL directly
-      // Get any avs token from the current page
-      await this.harvestAvs();
-      const anyToken = this.avsTokens.values().next().value;
-      if (anyToken && anyToken.avs) {
-        const detailUrl = `${AVANTIO_BASE}/index.php?record=${avantioId}&module=${module}&action=DetailView&avs=${encodeURIComponent(anyToken.avs)}`;
-        const newPage = await this.page.context().newPage();
-        await newPage.goto(detailUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
-        await delay(8000);
-
-        const data = await this._extractDetailFromPage(newPage);
-        await newPage.close().catch(() => {});
-
-        if (Object.keys(data).length > 0) {
-          const record = this._mapDetailToRecord(entityType, data);
-          await this._postToLaravel(entityType, [record]);
-          return data;
-        }
-      }
+    if (foundIndex < 0) {
+      log(`  Could not find record ${avantioId} in list.`);
       return null;
     }
 
-    // Click the "See" button for this specific record
-    const clicked = await this.page.evaluate(({ wcSel, recId }) => {
+    // Click "See" on the found row
+    const clicked = await this.page.evaluate(({ wcSel, rSel, idx }) => {
       const wc = document.querySelector(wcSel);
       if (!wc || !wc.shadowRoot) return false;
-
-      // Find the row containing this record
-      const rows = wc.shadowRoot.querySelectorAll('[data-testid="row-list"], .alib-vertical-card');
-      for (const row of rows) {
-        const links = row.querySelectorAll('a[href*="record="]');
-        let isTarget = false;
-        for (const a of links) {
-          if ((a.getAttribute('href') || '').includes(`record=${recId}`)) {
-            isTarget = true;
-            break;
-          }
-        }
-        // Also check by text content
-        if (!isTarget && row.textContent.includes(recId)) isTarget = true;
-
-        if (isTarget) {
-          const seeBtn = row.querySelector('button[aria-label="See"]');
-          if (seeBtn) { seeBtn.click(); return true; }
-        }
-      }
+      const rows = wc.shadowRoot.querySelectorAll(rSel);
+      if (idx >= rows.length) return false;
+      const btn = rows[idx].querySelector('button[aria-label="See"]');
+      if (btn) { btn.click(); return true; }
       return false;
-    }, { wcSel: wcSelector, recId: avantioId });
+    }, { wcSel: wcSelector, rSel: rowSelector, idx: foundIndex });
 
     if (!clicked) {
-      log(`  Could not click See for record ${avantioId}`);
+      log(`  Could not click See on row ${foundIndex}.`);
       return null;
     }
 
@@ -1139,8 +1191,7 @@ class AvantioScraper {
     let detailPage = null;
     for (let i = 0; i < 15; i++) {
       await delay(1000);
-      const pages = this.page.context().pages();
-      for (const p of pages) {
+      for (const p of this.page.context().pages()) {
         if (p.url().includes('action=DetailView') && p.url().includes('record=')) {
           detailPage = p;
           break;
@@ -1150,24 +1201,25 @@ class AvantioScraper {
     }
 
     if (!detailPage) {
-      log(`  No detail tab opened for ${avantioId}`);
+      log(`  No detail tab opened.`);
       return null;
     }
 
     await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
     log(`  Detail tab: ${detailPage.url().substring(0, 80)}`);
-    await delay(8000);
+    await delay(5000);
 
     const data = await this._extractDetailFromPage(detailPage);
     await detailPage.close().catch(() => {});
 
-    if (Object.keys(data).length > 0) {
-      log(`  Extracted ${Object.keys(data).length} fields for ${avantioId}`);
+    if (Object.keys(data).length > 5) {
+      log(`  Extracted ${Object.keys(data).length} fields.`);
       const record = this._mapDetailToRecord(entityType, data);
       await this._postToLaravel(entityType, [record]);
       return data;
     }
 
+    log(`  Too few fields (${Object.keys(data).length}).`);
     return null;
   }
 
