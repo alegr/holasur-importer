@@ -156,10 +156,10 @@ app.post('/import/start', async (req, res) => {
       }
 
       // Now that we're logged in, wait for dashboard to fully render
-      log(`[${sessionId}] Logged in, waiting for dashboard tokens...`);
+      log(`[${sessionId}] Logged in, loading dashboard...`);
       const { extractAvsFromHtml } = require('./utils');
-      for (let i = 0; i < 10; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+      for (let i = 0; i < 8; i++) {
+        await new Promise(r => setTimeout(r, 1000));
         const html = await page.content().catch(() => '');
         const tokens = extractAvsFromHtml(html);
         if (tokens.size >= 10) {
