@@ -82,7 +82,7 @@ app.post('/import/start', async (req, res) => {
         '--enable-features=PasswordManager,PasswordManagerOnboarding',
       ],
       viewport: { width: 880, height: 650 },
-      acceptDownloads: false,
+      acceptDownloads: true,
     });
     const browser = context;
 
@@ -281,8 +281,8 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
   }
 
   const methods = {
-    properties: () => session.scraper.importProperties(),
-    bookings: () => session.scraper.importBookings(),
+    properties: () => session.scraper.importPropertiesCSV(),
+    bookings: () => session.scraper.importBookingsCSV(),
     owners: () => session.scraper.importOwners(),
     customers: () => session.scraper.importCustomers(),
     tasks: () => session.scraper.importTasks(),
@@ -472,9 +472,9 @@ app.post('/import/:sessionId/test/:entity', async (req, res) => {
   const scraper = session.scraper;
   const methods = {
     owners: () => scraper.importOwners(),
-    properties: () => scraper.importProperties(),
+    properties: () => scraper.importPropertiesCSV(),
     customers: () => scraper.importCustomers(),
-    bookings: () => scraper.importBookings(),
+    bookings: () => scraper.importBookingsCSV(),
     tasks: () => scraper.importTasks(),
   };
 
