@@ -371,7 +371,198 @@ class AvantioScraper {
   }
 
   // ---------------------------------------------------------------------------
-  // Entity-specific import methods
+  // CSV-based import (primary method)
+  // ---------------------------------------------------------------------------
+
+  async _downloadAndParseCSV(wcSelector) {
+    log('  Clicking More actions → CSV download...');
+    await this.page.evaluate((wcSel) => {
+      const wc = document.querySelector(wcSel);
+      if (!wc || !wc.shadowRoot) return;
+      for (const btn of wc.shadowRoot.querySelectorAll('button'))
+        if (btn.textContent.trim() === 'More actions') { btn.click(); return; }
+    }, wcSelector);
+    await delay(2000);
+
+    const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+
+    await this.page.evaluate((wcSel) => {
+      const wc = document.querySelector(wcSel);
+      if (!wc || !wc.shadowRoot) return;
+      for (const btn of wc.shadowRoot.querySelectorAll('button')) {
+        const t = btn.textContent.trim();
+        if (t === 'Download CSV' || t === 'Export CSV') { btn.click(); return; }
+      }
+    }, wcSelector);
+
+    let download;
+    try { download = await downloadPromise; } catch { log('  CSV download timed out.'); return []; }
+
+    const tmpFile = `/tmp/holasur-csv-${Date.now()}.csv`;
+    await download.saveAs(tmpFile);
+    const size = fs.statSync(tmpFile).size;
+    log(`  CSV saved (${size} bytes)`);
+
+    const content = fs.readFileSync(tmpFile, 'utf-8');
+    // Save a debug copy
+    const debugFile = `/tmp/holasur-last-csv-${Date.now()}.csv`;
+    fs.copyFileSync(tmpFile, debugFile);
+    log(`  Debug copy: ${debugFile}`);
+    const rows = this._parseCSV(content);
+    fs.unlinkSync(tmpFile);
+    log(`  Parsed ${rows.length} rows from CSV.`);
+    return rows;
+  }
+
+  _parseCSV(content) {
+    const lines = content.split('\n').map(l => l.trim()).filter(l => l);
+    if (lines.length < 2) return [];
+
+    // Auto-detect delimiter: semicolons or commas
+    const firstLines = lines.slice(0, 3).join('\n');
+    const semicolons = (firstLines.match(/;/g) || []).length;
+    const commas = (firstLines.match(/,/g) || []).length;
+    const delimiter = semicolons > commas ? ';' : ',';
+    log(`  CSV delimiter: "${delimiter}" (${semicolons} semicolons, ${commas} commas)`);
+
+    const parseRow = (line) => {
+      const result = [];
+      let current = '';
+      let inQuotes = false;
+      for (const ch of line) {
+        if (ch === '"') { inQuotes = !inQuotes; continue; }
+        if (ch === delimiter && !inQuotes) { result.push(current.trim()); current = ''; continue; }
+        current += ch;
+      }
+      result.push(current.trim());
+      return result;
+    };
+
+    // Detect header row: first row with many non-empty unique values is the header
+    // Avantio bookings CSV has: title row (line 0), header row (line 1), data (line 2+)
+    // Avantio properties CSV might have: header row (line 0), data (line 1+)
+    let headerIdx = 0;
+    for (let i = 0; i < Math.min(3, lines.length); i++) {
+      const cols = parseRow(lines[i]);
+      const nonEmpty = cols.filter(c => c).length;
+      // A header row has many unique non-numeric values
+      const hasLetters = cols.filter(c => c && /[a-zA-Z]/.test(c) && !/^\d+\/\d+\/\d+$/.test(c)).length;
+      if (hasLetters >= 3 && nonEmpty >= 5) {
+        headerIdx = i;
+        break;
+      }
+    }
+
+    // Check if the row BEFORE the header is a title row (single merged cell with few values)
+    if (headerIdx > 0) {
+      const prevRow = parseRow(lines[headerIdx - 1]);
+      const prevNonEmpty = prevRow.filter(c => c).length;
+      if (prevNonEmpty <= 2) {
+        // Title row confirmed, header is at headerIdx
+      }
+    }
+
+    const headers = parseRow(lines[headerIdx]);
+    log(`  CSV header at line ${headerIdx}: ${headers.slice(0, 5).join(', ')}... (${headers.filter(h=>h).length} columns)`);
+
+    const rows = [];
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      const values = parseRow(lines[i]);
+      if (values.length < 3) continue;
+      // Skip rows that look like the header repeated
+      if (values[0] === headers[0] && values[1] === headers[1]) continue;
+      const obj = {};
+      headers.forEach((h, idx) => { if (h && values[idx] !== undefined) obj[h] = values[idx]; });
+      rows.push(obj);
+    }
+    return rows;
+  }
+
+  _parseCSVDate(dateStr) {
+    if (!dateStr) return null;
+    const m = dateStr.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    if (m) return `${m[3]}-${m[1]}-${m[2]}`;
+    return dateStr;
+  }
+
+  async importBookingsCSV() {
+    log('=== Importing Bookings via CSV ===');
+    this.status = 'importing';
+
+    const bookingsUrl = await this.page.evaluate(() => {
+      const menu = document.querySelector('avantio-menu');
+      if (!menu || !menu.shadowRoot) return null;
+      for (const a of menu.shadowRoot.querySelectorAll('a'))
+        if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) return a.href;
+      return null;
+    });
+    if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await delay(5000);
+
+    const rows = await this._downloadAndParseCSV('avantio-bookings-list');
+    if (rows.length === 0) { log('  No CSV data. Falling back to scraping...'); return this.importBookings(); }
+
+    const records = rows.map(r => ({
+      avantio_id: r['Booking number'] || `csv-${Date.now()}`,
+      avantio_reference: r['Booking number'],
+      check_in: this._parseCSVDate(r['Check-in date']),
+      check_out: this._parseCSVDate(r['Check-out date']),
+      nights: parseInt(r['nights']) || null,
+      total_amount: parseFloat(r['Booking total with tax']) || 0,
+      adults: parseInt(r['Adults']) || null,
+      children: parseInt(r['Children']) || null,
+      status: (r['Status'] || '').toLowerCase().replace(/ /g, '_'),
+      channel: r['Portal / Agent'] || null,
+      currency: 'USD',
+      is_revenue: !['not_available', 'owner_booking'].includes((r['Status'] || '').toLowerCase().replace(/ /g, '_')),
+      property_avantio_id: r['Property ID'] || null,
+      _csv: r,
+    }));
+
+    await this._postToLaravel('bookings', records);
+    this.importResults.bookings = records.length;
+    log(`  Imported ${records.length} bookings from CSV.`);
+    return records;
+  }
+
+  async importPropertiesCSV() {
+    log('=== Importing Properties via CSV ===');
+    this.status = 'importing';
+
+    await this.navigateToModule('Propiedades', 'ListViewPropiedades');
+    await delay(5000);
+
+    const rows = await this._downloadAndParseCSV('avantio-accommodations-list');
+    if (rows.length === 0) { log('  No CSV data. Falling back to scraping...'); return this.importProperties(); }
+
+    // Log column names for mapping
+    if (rows.length > 0) log(`  CSV columns: ${Object.keys(rows[0]).join(', ')}`);
+
+    const records = rows.map(r => {
+      const record = { _csv: r };
+      // Properties CSV columns: Owner ID, Code, Status, Property, Type, Max. guest capacity,
+      // Rate, Building, Photo gallery, Town, Area, ZIP, Street type, Address,
+      // Building/house number, Staircase, Floor, Apartment, Owner, Registration Number
+      record.avantio_id = r['Code'] || r['Property ID'] || r['ID'] || Object.values(r)[1];
+      record.name = r['Property'] || r['Property name'] || r['Name'] || '';
+      record.type = r['Type'] || r['Property type'] || null;
+      record.location = r['Town'] || r['City'] || r['Location'] || null;
+      record.status = (r['Status'] || 'Active').includes('Deactivated') ? 'Deactivated' : 'Active';
+      record.max_guests = parseInt(r['Max. guest capacity'] || r['Max guests']) || null;
+      // Build full address
+      const addrParts = [r['Address'], r['Building/house number'], r['Floor'] ? `Piso ${r['Floor']}` : null, r['Apartment / Unit / Suite number']].filter(Boolean);
+      if (addrParts.length) record.address = addrParts.join(' ');
+      return record;
+    });
+
+    await this._postToLaravel('properties', records);
+    this.importResults.properties = records.length;
+    log(`  Imported ${records.length} properties from CSV.`);
+    return records;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Entity-specific import methods (scraping fallback)
   // ---------------------------------------------------------------------------
 
   async importOwners() {
