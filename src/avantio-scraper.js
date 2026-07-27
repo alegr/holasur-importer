@@ -1,6 +1,8 @@
 const { parseAvantioResponse, extractAvsFromHtml, delay, log } = require('./utils');
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const LARAVEL_API = 'http://localhost:8001/api/import';
 const LARAVEL_API_BASE = 'http://localhost:8001/api';
