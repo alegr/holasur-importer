@@ -167,6 +167,20 @@ app.post('/import/start', async (req, res) => {
           break;
         }
       }
+      // Minimize the Avantio browser so focus returns to the HolaSur app
+      log(`[${sessionId}] Minimizing browser window...`);
+      try {
+        const cdp = await page.context().newCDPSession(page);
+        await cdp.send('Browser.setWindowBounds', {
+          windowId: (await cdp.send('Browser.getWindowForTarget')).windowId,
+          bounds: { windowState: 'minimized' },
+        });
+      } catch {
+        // Fallback: just navigate away focus
+        log(`[${sessionId}] CDP minimize failed, trying JS blur...`);
+        await page.evaluate(() => window.blur()).catch(() => {});
+      }
+
       session.status = 'logged_in';
     });
 
@@ -232,7 +246,11 @@ app.post('/import/:sessionId/run', async (req, res) => {
     session.status = 'importing';
     const results = await session.scraper.runFullImport();
     session.status = 'done';
-    log(`[${sessionId}] Import finished: ${JSON.stringify(results)}`);
+    log(`[${sessionId}] Import finished: ${JSON.stringify(results)}. Closing browser.`);
+    setTimeout(async () => {
+      try { await session.browser.close(); } catch {}
+      sessions.delete(sessionId);
+    }, 2000);
   } catch (err) {
     session.status = 'error';
     session.error = err.message;
@@ -282,7 +300,12 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     await methods[entity]();
     session.status = 'done';
     session.scraper.status = 'done';
-    log(`[${sessionId}] ${entity} import finished.`);
+    log(`[${sessionId}] ${entity} import finished. Closing browser.`);
+    // Auto-close browser after import
+    setTimeout(async () => {
+      try { await session.browser.close(); } catch {}
+      sessions.delete(sessionId);
+    }, 2000);
   } catch (err) {
     session.status = 'error';
     session.error = err.message;
@@ -608,6 +631,14 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
       detail = await session.scraper.importOneDetail(entity);
     }
     res.json({ entity, detail, status: detail ? 'done' : 'no_data' });
+    // Auto-close browser after detail scrape
+    if (detail) {
+      setTimeout(async () => {
+        try { await session.browser.close(); } catch {}
+        sessions.delete(sessionId);
+        log(`[${sessionId}] Browser closed after detail scrape.`);
+      }, 2000);
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
