@@ -4,8 +4,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
-const LARAVEL_API = 'http://localhost:8001/api/import';
-const LARAVEL_API_BASE = 'http://localhost:8001/api';
+const LARAVEL_API = process.env.HOLASUR_API_URL || 'http://localhost:8001/api/import';
+const LARAVEL_API_BASE = process.env.HOLASUR_API_URL?.replace('/import', '') || 'http://localhost:8001/api';
 const AVANTIO_BASE = 'https://app.avantio.pro';
 const PAGE_SIZE = 30;
 
@@ -89,13 +89,18 @@ class AvantioScraper {
    * @returns {Promise<boolean>}
    */
   async waitForLogin(timeoutMs = 300_000) {
-    log('Waiting for user to complete login...');
+    log('Waiting for login...');
     this.status = 'waiting_for_login';
+
+    // Auto-login with env credentials if available
+    const avantioEmail = process.env.AVANTIO_EMAIL;
+    const avantioPassword = process.env.AVANTIO_PASSWORD;
+    let autoLoginAttempted = false;
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
-        // Check the actual module= param (not return_module) to avoid false positives
+        // Check if already logged in
         const isLoggedIn = await this.page.evaluate(() => {
           const url = new URL(window.location.href);
           const module = url.searchParams.get('module');
@@ -106,6 +111,33 @@ class AvantioScraper {
           log('Login detected.');
           this.status = 'logged_in';
           return true;
+        }
+
+        // Auto-login: if we have credentials and haven't tried yet
+        if (avantioEmail && avantioPassword && !autoLoginAttempted) {
+          autoLoginAttempted = true;
+          log('Auto-login with env credentials...');
+          try {
+            // Wait for login form
+            const emailInput = await this.page.waitForSelector(
+              'input[name="user_name"], input[type="email"], input[name="email"]',
+              { timeout: 10000, state: 'visible' }
+            ).catch(() => null);
+
+            if (emailInput) {
+              await emailInput.fill(avantioEmail);
+              const passInput = await this.page.$('input[type="password"], input[name="user_password"]');
+              if (passInput) await passInput.fill(avantioPassword);
+              const submitBtn = await this.page.$('button[type="submit"], input[type="submit"], input[name="Login"]');
+              if (submitBtn) await submitBtn.click();
+              log('Credentials submitted, waiting for redirect...');
+              await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+              await delay(3000);
+              continue; // Re-check if logged in
+            }
+          } catch (e) {
+            log(`Auto-login error: ${e.message.substring(0, 60)}`);
+          }
         }
 
         // Alternative: check for a known post-login DOM element

@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const { chromium } = require('playwright');
 const { AvantioScraper } = require('./avantio-scraper');
@@ -823,4 +824,82 @@ app.listen(PORT, () => {
   log('  POST /import/:id/status      — check status');
   log('  POST /import/:id/run         — start import (after login)');
   log('  POST /import/:id/stop        — close browser');
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/:sessionId/login
+// Type Avantio credentials into the headless browser login form.
+// Body: { email: "...", password: "..." } or { code: "..." } for 2FA
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/login', async (req, res) => {
+  const { sessionId } = req.params;
+  const { email, password, code } = req.body || {};
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+
+  try {
+    const page = session.page;
+    const url = page.url();
+
+    if (code) {
+      // 2FA code entry
+      log(`[${sessionId}] Entering 2FA code...`);
+      const codeInput = await page.waitForSelector('input[type="text"], input[type="number"], input[name*="code"], input[name*="otp"]', { timeout: 5000 }).catch(() => null);
+      if (codeInput) {
+        await codeInput.fill(code);
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Enviar")');
+        if (submitBtn) await submitBtn.click();
+        await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 3000));
+        const newUrl = page.url();
+        const is2FA = !newUrl.includes('module=Home');
+        return res.json({ status: is2FA ? 'needs_2fa' : 'logged_in', url: newUrl.substring(0, 80) });
+      }
+      return res.json({ status: 'error', error: 'No 2FA input found' });
+    }
+
+    if (email && password) {
+      log(`[${sessionId}] Typing Avantio credentials...`);
+      // Find and fill email field
+      const emailInput = await page.waitForSelector('input[name="user_name"], input[type="email"], input[name="email"], input[type="text"]', { timeout: 10000 }).catch(() => null);
+      if (!emailInput) return res.json({ status: 'error', error: 'Login form not found' });
+      
+      await emailInput.fill(email);
+      
+      // Find and fill password field
+      const passInput = await page.$('input[type="password"], input[name="user_password"]');
+      if (passInput) await passInput.fill(password);
+      
+      // Click submit
+      const submitBtn = await page.$('button[type="submit"], input[type="submit"], input[name="Login"], button:has-text("Log in"), button:has-text("Iniciar"), button:has-text("Acceder")');
+      if (submitBtn) await submitBtn.click();
+      
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      await new Promise(r => setTimeout(r, 3000));
+      
+      const newUrl = page.url();
+      const needs2FA = !newUrl.includes('module=Home') && !newUrl.includes('module=Dashboard');
+      const loggedIn = newUrl.includes('module=Home') || newUrl.includes('module=Dashboard');
+      
+      // Take a screenshot to help debug
+      const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
+      const screenshotB64 = screenshot ? screenshot.toString('base64') : null;
+      
+      return res.json({ 
+        status: loggedIn ? 'logged_in' : needs2FA ? 'needs_2fa' : 'error',
+        url: newUrl.substring(0, 80),
+        screenshot: screenshotB64 ? `data:image/jpeg;base64,${screenshotB64}` : null
+      });
+    }
+
+    // No credentials — just return current state + screenshot
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
+    return res.json({
+      status: url.includes('module=Home') ? 'logged_in' : 'needs_login',
+      url: url.substring(0, 80),
+      screenshot: screenshot ? `data:image/jpeg;base64,${screenshot.toString('base64')}` : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });

@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "express": "^4.21.0",
     "playwright": "^1.48.0"
   }
