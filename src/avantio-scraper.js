@@ -140,6 +140,18 @@ class AvantioScraper {
           }
         }
 
+        // Check for 2FA page
+        const is2FA = await this.page.evaluate(() => {
+          const text = document.body?.textContent || '';
+          return text.includes('verification code') || text.includes('Two-step') || text.includes('2FA') || text.includes('Verify');
+        }).catch(() => false);
+
+        if (is2FA) {
+          log('2FA page detected. Waiting for code...');
+          this.status = 'needs_2fa';
+          // Don't return — keep polling. The /login endpoint will submit the code.
+        }
+
         // Alternative: check for a known post-login DOM element
         const loggedIn = await this.page.evaluate(() => {
           return (
