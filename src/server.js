@@ -286,6 +286,10 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     owners: () => session.scraper.importOwners(),
     customers: () => session.scraper.importCustomers(),
     tasks: () => session.scraper.importTasks(),
+    payments_received: () => session.scraper.importPaymentsReceived(),
+    payments_made: () => session.scraper.importPaymentsMade(),
+    payments_pending: () => session.scraper.importPaymentsToMake(),
+    payments_outstanding: () => session.scraper.importPaymentsOutstanding(),
   };
 
   if (!methods[entity]) {
@@ -476,6 +480,10 @@ app.post('/import/:sessionId/test/:entity', async (req, res) => {
     customers: () => scraper.importCustomers(),
     bookings: () => scraper.importBookingsCSV(),
     tasks: () => scraper.importTasks(),
+    payments_received: () => scraper.importPaymentsReceived(),
+    payments_made: () => scraper.importPaymentsMade(),
+    payments_pending: () => scraper.importPaymentsToMake(),
+    payments_outstanding: () => scraper.importPaymentsOutstanding(),
   };
 
   if (!methods[entity]) {
@@ -639,6 +647,85 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
         log(`[${sessionId}] Browser closed after detail scrape.`);
       }, 2000);
     }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/:sessionId/export-page
+// Export data from a PHP page's Export/Excel link. Returns parsed rows.
+// ---------------------------------------------------------------------------
+app.post('/import/:sessionId/export-page', async (req, res) => {
+  const { sessionId } = req.params;
+  const linkText = req.body?.linkText || 'Excel';
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+
+  try {
+    const page = session.page;
+
+    // Open Export dropdown
+    await page.evaluate(() => {
+      for (const btn of document.querySelectorAll('button'))
+        if (btn.textContent.trim() === 'Export') { btn.click(); return; }
+    });
+    await new Promise(r => setTimeout(r, 1000));
+
+    // Click the export link with download handler
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 30000 }),
+      page.evaluate((text) => {
+        for (const a of document.querySelectorAll('a'))
+          if (a.textContent.trim() === text) { a.click(); return true; }
+        return false;
+      }, linkText),
+    ]);
+
+    const fs = require('fs');
+    const tmpFile = `/tmp/holasur-export-${Date.now()}.xls`;
+    await download.saveAs(tmpFile);
+    const content = fs.readFileSync(tmpFile, 'utf-8');
+    const size = fs.statSync(tmpFile).size;
+
+    // Parse the export — could be HTML table, CSV text, or XLS binary
+    const rows = [];
+    const headers = [];
+
+    if (content.includes('<table') || content.includes('<tr')) {
+      // HTML table format
+      const trMatches = [...content.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+      if (trMatches.length > 0) {
+        for (const m of trMatches[0][1].matchAll(/<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/gi))
+          headers.push(m[1].replace(/<[^>]*>/g, '').trim());
+        for (let i = 1; i < trMatches.length; i++) {
+          const cells = [];
+          for (const m of trMatches[i][1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi))
+            cells.push(m[1].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').trim());
+          if (cells.length >= 3) {
+            const obj = {};
+            headers.forEach((h, idx) => { if (h && cells[idx] !== undefined) obj[h] = cells[idx]; });
+            rows.push(obj);
+          }
+        }
+      }
+    } else {
+      // CSV/text format — use the scraper's CSV parser
+      const parsed = session.scraper._parseCSV(content);
+      if (parsed.length > 0) {
+        Object.keys(parsed[0]).forEach(k => headers.push(k));
+        rows.push(...parsed);
+      }
+    }
+
+    // Keep debug copy
+    const debugFile = `/tmp/holasur-export-debug-${Date.now()}.csv`;
+    fs.copyFileSync(tmpFile, debugFile);
+    log(`[${sessionId}] Debug copy: ${debugFile}`);
+    fs.unlinkSync(tmpFile);
+    log(`[${sessionId}] Exported ${rows.length} rows (${size} bytes, ${headers.length} columns)`);
+
+    res.json({ rows: rows.length, headers, data: rows, size });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

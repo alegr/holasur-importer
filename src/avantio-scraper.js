@@ -763,6 +763,227 @@ class AvantioScraper {
   }
 
   // ---------------------------------------------------------------------------
+  // Payments CSV import (old PHP pages with Export → Csv)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Generic payment CSV import.
+   * Navigates to the payment list page via avantio-menu, clicks Export → Csv,
+   * parses the downloaded CSV, maps to avantio_payments schema, and POSTs to Laravel.
+   *
+   * @param {string} paymentType - 'received', 'made', or 'pending'
+   * @param {string} menuLinkText - Text of the menu link to click (e.g. "List of payments received")
+   */
+  async importPaymentsCSV(paymentType, menuLinkText) {
+    log(`=== Importing Payments (${paymentType}) via CSV ===`);
+    this.status = 'importing';
+
+    // Navigate to the payments page via the avantio-menu sidebar
+    log(`  Looking for menu link: "${menuLinkText}"...`);
+    const navigated = await this.page.evaluate((linkText) => {
+      const menu = document.querySelector('avantio-menu');
+      if (!menu || !menu.shadowRoot) return false;
+      for (const a of menu.shadowRoot.querySelectorAll('a')) {
+        if (a.textContent.trim() === linkText) {
+          window.location.href = a.href;
+          return true;
+        }
+      }
+      return false;
+    }, menuLinkText);
+
+    if (navigated) {
+      await this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+      await delay(5000);
+      log(`  Arrived at ${this.page.url().substring(0, 100)}`);
+    } else {
+      log(`  Menu link "${menuLinkText}" not found, trying onclick handlers...`);
+      const clickedOnclick = await this.page.evaluate((linkText) => {
+        for (const el of document.querySelectorAll('[onclick*="redireccion"]')) {
+          if (el.textContent.trim().includes(linkText)) {
+            el.click();
+            return true;
+          }
+        }
+        // Also try regular links outside shadow DOM
+        for (const a of document.querySelectorAll('a')) {
+          if (a.textContent.trim() === linkText) {
+            a.click();
+            return true;
+          }
+        }
+        return false;
+      }, menuLinkText);
+
+      if (clickedOnclick) {
+        await this.page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {});
+        await delay(5000);
+      } else {
+        throw new Error(`Could not find menu link "${menuLinkText}" for payments (${paymentType}).`);
+      }
+    }
+
+    // Wait for the page table to fully render
+    await delay(3000);
+
+    // Download the CSV using the old PHP page Export button pattern
+    const rows = await this._downloadPaymentsCSV();
+    if (rows.length === 0) {
+      log(`  No CSV data for payments (${paymentType}).`);
+      this.importResults[`payments_${paymentType}`] = 0;
+      return [];
+    }
+
+    if (rows.length > 0) log(`  CSV columns: ${Object.keys(rows[0]).join(', ')}`);
+
+    // Map CSV columns to avantio_payments schema
+    const records = rows.map((r, i) => {
+      const record = { _csv: r };
+
+      // Parse date (DD/MM/YYYY format from Avantio)
+      const rawDate = r['Date'] || r['Fecha'] || '';
+      record.date = this._parseCSVDate(rawDate);
+
+      record.payment_type = paymentType;
+
+      // Booking reference (only for "received" payments)
+      record.booking_reference = r['Booking number'] || r['Booking unique Id'] || null;
+
+      // Property code (for "made" and "pending" payments)
+      record.property_code = r['Property code'] || r['Property Code'] || null;
+
+      // Description / Details
+      record.description = r['Details'] || r["Property's name"] || r['Property name'] || '';
+
+      // Counterpart: Guest for received, Recipient for made/pending
+      record.counterpart = r['Guest'] || r['Recipient'] || null;
+
+      // Payment method
+      record.payment_method = r['Payment method'] || r['Payment Method'] || null;
+
+      // Amount — clean numeric
+      const rawAmount = r['Amount'] || r['Cantidad'] || '0';
+      record.amount = parseFloat(
+        rawAmount.replace(/[^\d.,\-]/g, '').replace(',', '.')
+      ) || 0;
+
+      record.currency = 'USD';
+
+      // State
+      record.state = r['State'] || r['Estado'] || (paymentType === 'pending' ? 'Pending' : 'Paid');
+
+      // Portal (for made/pending)
+      record.portal = r['Portal'] || null;
+
+      // Observations (for received)
+      record.observations = r['Observations'] || r['Observaciones'] || null;
+
+      // Generate a unique avantio_id from composite key
+      const idParts = [
+        paymentType,
+        record.date || '',
+        record.booking_reference || record.property_code || '',
+        record.counterpart || '',
+        String(record.amount),
+      ];
+      record.avantio_id = `pay-${paymentType}-${crypto.createHash('md5').update(idParts.join('|')).digest('hex').substring(0, 16)}`;
+
+      return record;
+    });
+
+    await this._postToLaravel('avantio_payments', records);
+    this.importResults[`payments_${paymentType}`] = records.length;
+    log(`  Imported ${records.length} payments (${paymentType}) from CSV.`);
+    return records;
+  }
+
+  /**
+   * Download CSV from old PHP page Export button.
+   * These pages use a button with class "button_listaExport" that opens a dropdown,
+   * then a "Csv" link inside the dropdown triggers the download.
+   */
+  async _downloadPaymentsCSV() {
+    log('  Clicking Export → Csv on PHP page...');
+
+    // Click the Export button to open the dropdown
+    await this.page.evaluate(() => {
+      // Try class-based selector first
+      const exportBtn = document.querySelector('.button_listaExport')
+        || document.querySelector('button.button_listaExport');
+      if (exportBtn) { exportBtn.click(); return; }
+      // Fallback: find button by text
+      for (const btn of document.querySelectorAll('button')) {
+        if (btn.textContent.trim() === 'Export') { btn.click(); return; }
+      }
+    });
+    await delay(2000);
+
+    // Set up download handler before clicking the Csv link
+    const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+
+    // Click the Csv link in the dropdown
+    await this.page.evaluate(() => {
+      for (const a of document.querySelectorAll('a')) {
+        const text = a.textContent.trim();
+        if (text === 'Csv' || text === 'CSV') { a.click(); return true; }
+      }
+      return false;
+    });
+
+    let download;
+    try {
+      download = await downloadPromise;
+    } catch {
+      log('  CSV download timed out.');
+      return [];
+    }
+
+    const tmpFile = `/tmp/holasur-payments-csv-${Date.now()}.csv`;
+    await download.saveAs(tmpFile);
+    const size = fs.statSync(tmpFile).size;
+    log(`  Payments CSV saved (${size} bytes)`);
+
+    const content = fs.readFileSync(tmpFile, 'utf-8');
+    // Save a debug copy
+    const debugFile = `/tmp/holasur-payments-debug-${Date.now()}.csv`;
+    fs.copyFileSync(tmpFile, debugFile);
+    log(`  Debug copy: ${debugFile}`);
+
+    const rows = this._parseCSV(content);
+    fs.unlinkSync(tmpFile);
+    log(`  Parsed ${rows.length} rows from payments CSV.`);
+    return rows;
+  }
+
+  /**
+   * Import payments received (208 records).
+   * Columns: Date, Booking number, Details, Guest, Payment method, Amount, Observations, Booking unique Id
+   */
+  async importPaymentsReceived() {
+    return this.importPaymentsCSV('received', 'List of payments received');
+  }
+
+  /**
+   * Import payments made (320 records).
+   * Columns: Date, Details, Recipient, Payment method, Amount, State, Property code, Property's name, Portal
+   */
+  async importPaymentsMade() {
+    return this.importPaymentsCSV('made', 'List of payments made');
+  }
+
+  /**
+   * Import payments to be made (124 records).
+   * Same structure as payments made but with State=Pending.
+   */
+  async importPaymentsToMake() {
+    return this.importPaymentsCSV('pending', 'List of payments to be made');
+  }
+
+  async importPaymentsOutstanding() {
+    return this.importPaymentsCSV('outstanding', 'List of outstanding payments receivable');
+  }
+
+  // ---------------------------------------------------------------------------
   // Full import orchestration
   // ---------------------------------------------------------------------------
 
