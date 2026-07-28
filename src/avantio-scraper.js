@@ -379,8 +379,11 @@ class AvantioScraper {
     await this.page.evaluate((wcSel) => {
       const wc = document.querySelector(wcSel);
       if (!wc || !wc.shadowRoot) return;
-      for (const btn of wc.shadowRoot.querySelectorAll('button'))
-        if (btn.textContent.trim() === 'More actions') { btn.click(); return; }
+      for (const btn of wc.shadowRoot.querySelectorAll('button')) {
+        const t = btn.textContent.trim();
+        const aria = btn.getAttribute('aria-label') || '';
+        if (t === 'More actions' || aria === 'More actions') { btn.click(); return; }
+      }
     }, wcSelector);
     await delay(2000);
 
@@ -391,7 +394,7 @@ class AvantioScraper {
       if (!wc || !wc.shadowRoot) return;
       for (const btn of wc.shadowRoot.querySelectorAll('button')) {
         const t = btn.textContent.trim();
-        if (t === 'Download CSV' || t === 'Export CSV') { btn.click(); return; }
+        if (t === 'Download CSV' || t === 'Export CSV' || t === 'Download csv') { btn.click(); return; }
       }
     }, wcSelector);
 
@@ -980,7 +983,55 @@ class AvantioScraper {
   }
 
   async importPaymentsOutstanding() {
-    return this.importPaymentsCSV('outstanding', 'List of outstanding payments receivable');
+    log('=== Importing Outstanding Payments via CSV ===');
+    this.status = 'importing';
+
+    // Navigate via menu
+    const url = await this.page.evaluate(() => {
+      const menu = document.querySelector('avantio-menu');
+      if (!menu || !menu.shadowRoot) return null;
+      for (const a of menu.shadowRoot.querySelectorAll('a'))
+        if (a.textContent.trim() === 'List of outstanding payments receivable') return a.href;
+      return null;
+    });
+    if (url) await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await delay(5000);
+
+    // This page uses avantio-pending-payments-list web component (like bookings)
+    const rows = await this._downloadAndParseCSV('avantio-pending-payments-list');
+    if (rows.length === 0) {
+      log('  No CSV data for outstanding payments.');
+      return [];
+    }
+
+    // Map CSV columns to our payments schema
+    const records = rows.map(r => {
+      const record = {
+        payment_type: 'outstanding',
+        raw_data: r,
+      };
+      // Map known columns (discover from first row)
+      for (const [k, v] of Object.entries(r)) {
+        const kl = k.toLowerCase();
+        if (kl.includes('date') && !record.date) record.date = this._parseCSVDate(v) || v;
+        if (kl.includes('amount') || kl.includes('import')) record.amount = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+        if (kl.includes('reservation') || kl.includes('booking')) record.booking_reference = v;
+        if (kl.includes('payer') || kl.includes('guest')) record.counterpart = v;
+        if (kl.includes('state') || kl.includes('status')) record.state = v;
+        if (kl.includes('portal') || kl.includes('commission')) record.portal = v;
+        if (kl.includes('property') || kl.includes('code')) record.property_code = v;
+        if (kl.includes('method')) record.payment_method = v;
+      }
+      record.avantio_id = require('crypto').createHash('md5')
+        .update(`outstanding-${record.date}-${record.booking_reference}-${record.amount}`)
+        .digest('hex').substring(0, 16);
+      return record;
+    });
+
+    await this._postToLaravel('avantio_payments', records);
+    this.importResults.payments_outstanding = records.length;
+    log(`  Imported ${records.length} outstanding payments.`);
+    return records;
   }
 
   // ---------------------------------------------------------------------------

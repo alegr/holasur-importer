@@ -304,12 +304,8 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     await methods[entity]();
     session.status = 'done';
     session.scraper.status = 'done';
-    log(`[${sessionId}] ${entity} import finished. Closing browser.`);
-    // Auto-close browser after import
-    setTimeout(async () => {
-      try { await session.browser.close(); } catch {}
-      sessions.delete(sessionId);
-    }, 2000);
+    log(`[${sessionId}] ${entity} import finished.`);
+    // Don't auto-close — session stays available for more imports
   } catch (err) {
     session.status = 'error';
     session.error = err.message;
