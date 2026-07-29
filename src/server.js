@@ -815,20 +815,55 @@ app.post('/import/:sessionId/login', async (req, res) => {
     if (code) {
       // 2FA code entry
       log(`[${sessionId}] Entering 2FA code...`);
-      const codeInput = await page.waitForSelector('input[type="text"], input[type="number"], input[name*="code"], input[name*="otp"]', { timeout: 5000 }).catch(() => null);
-      if (codeInput) {
-        await codeInput.fill(code);
-        const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Enviar")');
-        if (submitBtn) await submitBtn.click();
+
+      // Log the page state for debugging
+      const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '').catch(() => '');
+      log(`[${sessionId}] 2FA page text: ${pageText.substring(0, 200)}`);
+
+      // Try multiple selectors for the code input
+      const codeInput = await page.waitForSelector(
+        'input[name*="code"], input[name*="otp"], input[name*="token"], input[autocomplete="one-time-code"], input[type="number"], input[type="tel"]',
+        { timeout: 5000 }
+      ).catch(() => null);
+      // Fallback: any visible text input on the 2FA page
+      const input = codeInput || await page.$('input[type="text"]:visible').catch(() => null);
+
+      if (input) {
+        await input.fill(code);
+        log(`[${sessionId}] Filled 2FA code, clicking submit...`);
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Enviar"), button:has-text("Confirmar")');
+        if (submitBtn) {
+          await submitBtn.click();
+        } else {
+          // Try pressing Enter as fallback
+          await input.press('Enter');
+        }
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
+
         const newUrl = page.url();
-        const parsed2FA = new URL(newUrl);
-        const mod2FA = parsed2FA.searchParams.get('module');
-        const is2FA = mod2FA !== 'Home' && mod2FA !== 'Dashboard';
-        return res.json({ status: is2FA ? 'needs_2fa' : 'logged_in', url: newUrl.substring(0, 80) });
+        const loggedIn = await page.evaluate(() => {
+          const url = new URL(window.location.href);
+          const module = url.searchParams.get('module');
+          return module === 'Home' || module === 'Dashboard' ||
+            !!document.querySelector('avantio-menu') ||
+            !!document.querySelector('#menu_lateral');
+        }).catch(() => false);
+
+        // Check if there's an error message on the page (wrong code)
+        const errorMsg = await page.evaluate(() => {
+          const el = document.querySelector('.error, .alert-danger, .text-danger, [class*="error"]');
+          return el?.textContent?.trim() || null;
+        }).catch(() => null);
+
+        log(`[${sessionId}] After 2FA: ${newUrl.substring(0, 80)}, loggedIn=${loggedIn}, error=${errorMsg}`);
+        if (loggedIn) {
+          return res.json({ status: 'logged_in', url: newUrl.substring(0, 80) });
+        }
+        return res.json({ status: 'needs_2fa', url: newUrl.substring(0, 80), error: errorMsg || 'Código incorrecto' });
       }
-      return res.json({ status: 'error', error: 'No 2FA input found' });
+      log(`[${sessionId}] No 2FA input found on page`);
+      return res.json({ status: 'error', error: 'No se encontró el campo de verificación' });
     }
 
     if (email && password) {
@@ -851,33 +886,46 @@ app.post('/import/:sessionId/login', async (req, res) => {
       await new Promise(r => setTimeout(r, 3000));
       
       const newUrl = page.url();
-      const parsedNewUrl = new URL(newUrl);
-      const newModule = parsedNewUrl.searchParams.get('module');
-      const loggedIn = newModule === 'Home' || newModule === 'Dashboard';
-      const needs2FA = !loggedIn;
-      
-      // Take a screenshot to help debug
-      const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
-      const screenshotB64 = screenshot ? screenshot.toString('base64') : null;
-      
-      return res.json({ 
-        status: loggedIn ? 'logged_in' : needs2FA ? 'needs_2fa' : 'error',
+      const loggedIn = await page.evaluate(() => {
+        const url = new URL(window.location.href);
+        const module = url.searchParams.get('module');
+        return module === 'Home' || module === 'Dashboard' ||
+          !!document.querySelector('avantio-menu') ||
+          !!document.querySelector('#menu_lateral');
+      }).catch(() => false);
+
+      // Check if we're on the 2FA page
+      const is2FA = !loggedIn && await page.evaluate(() => {
+        const text = document.body?.textContent || '';
+        return text.includes('Two-step authentication enabled') || text.includes('Enter verification code');
+      }).catch(() => false);
+
+      // Check for login error message (wrong credentials)
+      const loginError = !loggedIn && !is2FA ? await page.evaluate(() => {
+        const el = document.querySelector('.error, .alert-danger, .text-danger, [class*="error"], .login-error');
+        return el?.textContent?.trim() || null;
+      }).catch(() => null) : null;
+
+      log(`[${sessionId}] After login: ${newUrl.substring(0, 80)}, loggedIn=${loggedIn}, is2FA=${is2FA}, error=${loginError}`);
+
+      return res.json({
+        status: loggedIn ? 'logged_in' : is2FA ? 'needs_2fa' : 'needs_login',
         url: newUrl.substring(0, 80),
-        screenshot: screenshotB64 ? `data:image/jpeg;base64,${screenshotB64}` : null
+        error: loginError || (!loggedIn && !is2FA ? 'Usuario o contraseña incorrectos' : undefined),
       });
     }
 
     // No credentials — just return current state + screenshot
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
-    // Use URLSearchParams to check the actual 'module' param, not substring match
-    // (login page URL contains return_module=Home which would false-positive)
-    const parsedUrl = new URL(url);
-    const moduleParam = parsedUrl.searchParams.get('module');
-    const isLoggedIn = moduleParam === 'Home' || moduleParam === 'Dashboard';
+    const isLoggedIn = await page.evaluate(() => {
+      const url = new URL(window.location.href);
+      const module = url.searchParams.get('module');
+      return module === 'Home' || module === 'Dashboard' ||
+        !!document.querySelector('avantio-menu') ||
+        !!document.querySelector('#menu_lateral');
+    }).catch(() => false);
     return res.json({
       status: isLoggedIn ? 'logged_in' : 'needs_login',
       url: url.substring(0, 80),
-      screenshot: screenshot ? `data:image/jpeg;base64,${screenshot.toString('base64')}` : null
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
