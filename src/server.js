@@ -247,6 +247,11 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     return res.status(400).json({ error: `Unknown entity: ${entity}` });
   }
 
+  // Prevent double-triggering — if already importing, just return current status
+  if (session.scraper.status === 'importing') {
+    return res.json({ sessionId, entity, status: 'importing', message: 'Import already in progress.' });
+  }
+
   res.json({ sessionId, entity, status: 'importing' });
 
   try {
@@ -767,7 +772,7 @@ app.post('/import/:sessionId/stop', async (req, res) => {
 // ---------------------------------------------------------------------------
 // Start the server
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   log(`HolaSur Importer service running on http://localhost:${PORT}`);
   log('Endpoints:');
   log('  POST /import/start           — launch browser');
@@ -775,6 +780,19 @@ app.listen(PORT, () => {
   log('  POST /import/:id/run         — start import (after login)');
   log('  POST /import/:id/stop        — close browser');
 });
+
+// Graceful shutdown — close browsers properly so cookies are flushed to disk
+async function shutdown() {
+  log('Shutting down — closing browsers gracefully...');
+  for (const [id, session] of sessions) {
+    try { await session.browser.close(); } catch {}
+    sessions.delete(id);
+  }
+  server.close();
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // ---------------------------------------------------------------------------
 // POST /import/:sessionId/login

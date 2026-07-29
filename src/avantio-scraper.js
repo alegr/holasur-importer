@@ -587,33 +587,41 @@ class AvantioScraper {
   // ---------------------------------------------------------------------------
 
   async importOwners() {
-    log('=== Importing Owners (Propietarios) ===');
+    log('=== Importing Owners from Properties CSV ===');
     this.status = 'importing';
-    await this.navigateToModule('Propietarios', 'ListView');
+
+    // Wait for page to settle after login
     await delay(3000);
+    await this.page.waitForLoadState('load').catch(() => {});
+    await delay(2000);
 
-    // Try all scraping approaches
-    await this._scrollToLoadAll();
-    let records = await this._scrapeCardsFromPage();
-    if (records.length === 0) {
-      log('  No cards, trying shadowRoot...');
-      records = await this._scrapeViaShadowRoot();
-    }
-    if (records.length === 0) {
-      log('  No shadow data, trying table/AJAX...');
-      records = await this.extractListData('Propietarios', 93);
+    // Navigate to properties list and download CSV — it has Owner ID and Owner columns
+    await this.navigateToModule('Propiedades', 'ListViewPropiedades');
+    await delay(5000);
+
+    const rows = await this._downloadAndParseCSV('avantio-accommodations-list');
+    if (rows.length === 0) {
+      log('  No properties CSV data — cannot extract owners.');
+      this.importResults.owners = 0;
+      return [];
     }
 
-    // Ensure avantio_id exists
-    records = records.map((r, i) => {
-      if (!r.avantio_id) {
-        r.avantio_id = r.name || `owner-${Date.now()}-${i}`;
+    // Extract unique owners from the properties CSV
+    const ownerMap = new Map();
+    for (const row of rows) {
+      const oid = (row['Owner ID'] || '').trim();
+      const name = (row['Owner'] || '').trim();
+      if (oid && name && !ownerMap.has(oid)) {
+        ownerMap.set(oid, { avantio_id: oid, name });
       }
-      return r;
-    });
+    }
+
+    const records = Array.from(ownerMap.values());
+    log(`  Found ${records.length} unique owners from ${rows.length} properties.`);
 
     await this._postToLaravel('owners', records);
     this.importResults.owners = records.length;
+    log(`  Imported ${records.length} owners.`);
     return records;
   }
 
@@ -1004,58 +1012,63 @@ class AvantioScraper {
     log('=== Importing Invoices via CSV ===');
     this.status = 'importing';
 
-    // Try to find the invoices page in the sidebar menu
-    const menuLinks = ['Invoices', 'Invoice list', 'Facturas', 'Lista de facturas', 'Proformas'];
+    // Navigate by clicking the sidebar link directly
+    const menuTexts = ['Issue invoices from bookings', 'Accounting documents'];
     let navigated = false;
 
-    for (const linkText of menuLinks) {
+    // Wait for page to settle after login
+    await delay(3000);
+    await this.page.waitForLoadState('load').catch(() => {});
+    await delay(2000);
+
+    for (const linkText of menuTexts) {
       const url = await this.page.evaluate((text) => {
         const menu = document.querySelector('avantio-menu');
         if (!menu || !menu.shadowRoot) return null;
         for (const a of menu.shadowRoot.querySelectorAll('a')) {
-          if (a.textContent.trim() === text) return a.href;
+          if (a.textContent.trim() === text && (a.href.includes('AccountingDocument') || a.href.includes('Facturacion'))) {
+            return a.href;
+          }
         }
         return null;
       }, linkText);
 
       if (url) {
-        log(`  Found menu link: "${linkText}"`);
-        await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        log(`  Found invoices URL: "${linkText}" → ${url.substring(0, 100)}`);
+        await this.page.evaluate((targetUrl) => { window.location.href = targetUrl; }, url);
+        await this.page.waitForURL(/Facturacion|AccountingDocument/, { timeout: 15000 }).catch(() => {});
         await delay(5000);
-        navigated = true;
+        if (this.page.url().includes('AccountingDocument') || this.page.url().includes('Facturacion')) {
+          navigated = true;
+        }
         break;
       }
     }
 
     if (!navigated) {
-      // Fallback: try navigating directly to the invoicing module
-      log('  No menu link found, trying direct navigation to Facturacion...');
-      const avsUrl = this._getSignedUrl('Facturacion', 'index');
-      if (avsUrl) {
-        await this.page.goto(avsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await delay(5000);
-        navigated = true;
-      }
-    }
-
-    if (!navigated) {
-      log('  Could not navigate to invoices page. Dumping available menu links...');
-      const allLinks = await this.page.evaluate(() => {
-        const menu = document.querySelector('avantio-menu');
-        if (!menu || !menu.shadowRoot) return [];
-        return Array.from(menu.shadowRoot.querySelectorAll('a'))
-          .map(a => a.textContent.trim())
-          .filter(t => t.length > 0);
-      }).catch(() => []);
-      log(`  Available menu links: ${JSON.stringify(allLinks)}`);
+      log('  Could not navigate to invoices page.');
       this.importResults.invoices = 0;
       return [];
     }
 
     log(`  Arrived at ${this.page.url().substring(0, 100)}`);
 
+    // Debug: dump page structure to understand the invoices page
+    const pageInfo = await this.page.evaluate(() => {
+      const wcs = Array.from(document.querySelectorAll('*')).filter(e => e.tagName.includes('-')).map(e => e.tagName.toLowerCase());
+      const uniqueWcs = [...new Set(wcs)];
+      const tables = document.querySelectorAll('table').length;
+      const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a.button, .btn'))
+        .map(b => b.textContent.trim()).filter(t => t.length > 0 && t.length < 50);
+      const iframes = document.querySelectorAll('iframe').length;
+      const exportLinks = Array.from(document.querySelectorAll('a[href*="export"], a[href*="csv"], a[href*="download"], a[href*="Export"]'))
+        .map(a => ({ text: a.textContent.trim(), href: a.href.substring(0, 100) }));
+      return { webComponents: uniqueWcs, tables, buttons: [...new Set(buttons)], iframes, exportLinks };
+    }).catch(() => ({}));
+    log(`  Page structure: ${JSON.stringify(pageInfo)}`);
+
     // Try CSV download from the web component on the page
-    const wcSelectors = ['avantio-invoices-list', 'avantio-invoice-list', 'avantio-proforma-list'];
+    const wcSelectors = ['avantio-invoices-list', 'avantio-invoice-list', 'avantio-billing-list', 'avantio-facturacion-list', 'avantio-proforma-list', 'avantio-accounting-document-list'];
     let rows = [];
 
     for (const wc of wcSelectors) {
@@ -1067,10 +1080,57 @@ class AvantioScraper {
       }
     }
 
-    // Fallback: try the old PHP page CSV export (like payments)
+    // Fallback: scrape HTML tables on the page
     if (rows.length === 0) {
-      log('  No web component CSV, trying PHP page export...');
-      rows = await this._downloadPaymentsCSV().catch(() => []);
+      log('  No web component CSV, scraping HTML tables...');
+      rows = await this.page.evaluate(() => {
+        // Helper: get clean text content (no script/style)
+        function cleanText(el) {
+          const clone = el.cloneNode(true);
+          clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+          return clone.textContent.trim();
+        }
+
+        // Find the main data table — look for one with a thead and multiple tbody rows
+        const tables = document.querySelectorAll('table');
+        let bestTable = null;
+        let bestRowCount = 0;
+        for (const table of tables) {
+          const bodyRows = table.querySelectorAll('tbody tr');
+          if (bodyRows.length > bestRowCount) {
+            bestTable = table;
+            bestRowCount = bodyRows.length;
+          }
+        }
+        if (!bestTable || bestRowCount < 1) return [];
+
+        // Extract headers from thead
+        const headerRow = bestTable.querySelector('thead tr');
+        if (!headerRow) return [];
+        const headers = Array.from(headerRow.querySelectorAll('th, td'))
+          .map(th => cleanText(th))
+          .filter(h => h.length > 0 && h.length < 50);
+        if (headers.length < 2) return [];
+
+        // Extract data rows from tbody
+        const results = [];
+        for (const row of bestTable.querySelectorAll('tbody tr')) {
+          const cells = row.querySelectorAll('td');
+          if (cells.length < 2) continue;
+          const record = {};
+          let hasData = false;
+          cells.forEach((cell, i) => {
+            if (i < headers.length) {
+              const val = cleanText(cell);
+              record[headers[i]] = val;
+              if (val.length > 0) hasData = true;
+            }
+          });
+          if (hasData) results.push(record);
+        }
+        return results;
+      }).catch(() => []);
+      if (rows.length > 0) log(`  Scraped ${rows.length} rows from HTML table`);
     }
 
     if (rows.length === 0) {
@@ -1081,25 +1141,46 @@ class AvantioScraper {
 
     if (rows.length > 0) log(`  CSV columns: ${Object.keys(rows[0]).join(', ')}`);
 
-    // Map CSV columns to invoices schema
+    // Map columns to invoices schema
+    // Known Avantio columns: Number, Invoice adding, Accommodation, Client/Guest,
+    // Owner, Invoice entry, Invoice exit, Status, Total
+    const columnMap = {
+      'number': 'invoice_number',
+      'invoice adding': 'type',
+      'accommodation': 'property_code',
+      'client/guest': 'customer_name',
+      'owner': 'description',
+      'invoice entry': 'date',
+      'invoice exit': 'due_date',
+      'status': 'status',
+      'total': 'total',
+    };
+
     const records = rows.map(r => {
       const record = { raw_data: r };
 
       for (const [k, v] of Object.entries(r)) {
-        const kl = k.toLowerCase();
-        if (kl.includes('invoice') && kl.includes('number') || kl.includes('factura') && kl.includes('num')) record.invoice_number = v;
-        if (kl.includes('date') && !kl.includes('due') && !record.date) record.date = this._parseCSVDate(v) || v;
-        if (kl.includes('due') || kl.includes('vencimiento')) record.due_date = this._parseCSVDate(v) || v;
-        if (kl.includes('type') || kl.includes('tipo')) record.type = v;
-        if (kl.includes('status') || kl.includes('estado') || kl.includes('state')) record.status = v;
-        if (kl.includes('booking') || kl.includes('reservation') || kl.includes('reserva')) record.booking_reference = v;
-        if (kl.includes('property') || kl.includes('accommodation') || kl.includes('alojamiento')) record.property_code = v;
-        if (kl.includes('customer') || kl.includes('guest') || kl.includes('client') || kl.includes('cliente')) record.customer_name = v;
-        if (kl.includes('subtotal') || kl.includes('base')) record.subtotal = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
-        if (kl.includes('tax') || kl.includes('iva') || kl.includes('impuesto')) record.tax_amount = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
-        if ((kl.includes('total') && !kl.includes('sub')) || kl.includes('amount') || kl.includes('importe')) record.total = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
-        if (kl.includes('currency') || kl.includes('moneda')) record.currency = v;
-        if (kl.includes('description') || kl.includes('concept') || kl.includes('descripcion')) record.description = v;
+        const kl = k.toLowerCase().trim();
+        // Skip junk columns (checkbox controls etc.)
+        if (kl.includes('select') || kl.includes('deselect') || kl.length > 40) continue;
+
+        // Try exact Avantio column match first
+        if (columnMap[kl]) {
+          const field = columnMap[kl];
+          if (field === 'total') {
+            record[field] = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+          } else if (field === 'date' || field === 'due_date') {
+            record[field] = this._parseCSVDate(v) || v;
+          } else {
+            record[field] = v;
+          }
+          continue;
+        }
+
+        // Generic keyword fallback
+        if (kl.includes('booking') || kl.includes('reservation')) record.booking_reference = v;
+        if (kl.includes('subtotal')) record.subtotal = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+        if (kl.includes('tax') || kl.includes('iva')) record.tax_amount = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
       }
 
       // Generate a unique ID
