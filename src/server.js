@@ -116,7 +116,7 @@ app.post('/import/start', async (req, res) => {
 
     // Start watching for login
     // Dashboard token harvesting happens AFTER login is detected (not before)
-    scraper.waitForLogin().then(async (loggedIn) => {
+    scraper.waitForLogin().then((loggedIn) => {
       const session = sessions.get(sessionId);
       if (!session) return;
 
@@ -126,32 +126,10 @@ app.post('/import/start', async (req, res) => {
         return;
       }
 
-      // Now that we're logged in, wait for dashboard to fully render
-      log(`[${sessionId}] Logged in, loading dashboard...`);
-      const { extractAvsFromHtml } = require('./utils');
-      for (let i = 0; i < 8; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        const html = await page.content().catch(() => '');
-        const tokens = extractAvsFromHtml(html);
-        if (tokens.size >= 10) {
-          log(`[${sessionId}] Dashboard ready with ${tokens.size} avs tokens.`);
-          break;
-        }
-      }
-      // Minimize the Avantio browser so focus returns to the HolaSur app
-      log(`[${sessionId}] Minimizing browser window...`);
-      try {
-        const cdp = await page.context().newCDPSession(page);
-        await cdp.send('Browser.setWindowBounds', {
-          windowId: (await cdp.send('Browser.getWindowForTarget')).windowId,
-          bounds: { windowState: 'minimized' },
-        });
-      } catch {
-        // Fallback: just navigate away focus
-        log(`[${sessionId}] CDP minimize failed, trying JS blur...`);
-        await page.evaluate(() => window.blur()).catch(() => {});
-      }
-
+      // Set logged_in immediately — don't do page interactions here
+      // because the /import/:entity endpoint may already be navigating the page.
+      // AVS token harvesting is done within each import method.
+      log(`[${sessionId}] Login detected by waitForLogin, setting status.`);
       session.status = 'logged_in';
     });
   } catch (err) {
