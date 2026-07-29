@@ -204,7 +204,7 @@ app.post('/import/:sessionId/run', async (req, res) => {
     ? session.scraper.status
     : session.status;
 
-  if (currentStatus !== 'logged_in') {
+  if (currentStatus === 'needs_login' || currentStatus === 'needs_2fa' || currentStatus === 'waiting_for_login' || currentStatus === 'initialized') {
     return res.status(400).json({
       error: `Cannot run import: current status is "${currentStatus}". User must be logged in first.`,
     });
@@ -246,7 +246,7 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     ? session.scraper.status
     : session.status;
 
-  if (currentStatus !== 'logged_in' && currentStatus !== 'done') {
+  if (currentStatus === 'needs_login' || currentStatus === 'needs_2fa' || currentStatus === 'waiting_for_login' || currentStatus === 'initialized') {
     return res.status(400).json({
       error: `Cannot import: status is "${currentStatus}". Login required.`,
     });
