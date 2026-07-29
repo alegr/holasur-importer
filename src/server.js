@@ -849,34 +849,46 @@ app.post('/import/:sessionId/login', async (req, res) => {
       }).catch(() => []);
       if (shadowInputs.length) log(`[${sessionId}] Shadow DOM inputs: ${JSON.stringify(shadowInputs)}`);
 
-      // Try multiple selectors for the code input
-      let input = await page.waitForSelector(
-        'input[name*="code"], input[name*="otp"], input[name*="token"], input[autocomplete="one-time-code"], input[type="number"], input[type="tel"]',
-        { timeout: 3000 }
-      ).catch(() => null);
-
-      // Fallback: any visible text input on the page
-      if (!input) {
-        const allInputs = await page.$$('input');
-        for (const inp of allInputs) {
-          const type = await inp.getAttribute('type').catch(() => '');
-          const visible = await inp.isVisible().catch(() => false);
-          if (visible && (!type || type === 'text' || type === 'number' || type === 'tel')) {
-            input = inp;
-            log(`[${sessionId}] Fallback: using visible input type=${type}`);
-            break;
+      // Fill the OTP field via JS (Avantio's form can have visibility quirks)
+      const filled = await page.evaluate((otpCode) => {
+        // Try the known Avantio OTP field first
+        let input = document.getElementById('otpToken');
+        if (!input) input = document.querySelector('input[name*="otp"], input[name*="code"]');
+        // Fallback: any visible text/number input
+        if (!input) {
+          const inputs = document.querySelectorAll('input[type="text"], input[type="number"], input[type="tel"]');
+          for (const inp of inputs) {
+            if (inp.offsetParent !== null && inp.name !== 'user_name') { input = inp; break; }
           }
         }
-      }
+        if (input) {
+          input.value = otpCode;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          return input.name || input.id || 'unknown';
+        }
+        return null;
+      }, code).catch(() => null);
 
-      if (input) {
-        await input.fill(code);
-        log(`[${sessionId}] Filled 2FA code, clicking submit...`);
-        const submitBtn = await page.$('button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Submit"), button:has-text("Enviar"), button:has-text("Confirmar")');
-        if (submitBtn) {
-          await submitBtn.click();
+      if (filled) {
+        log(`[${sessionId}] Filled 2FA code into field: ${filled}, clicking submit...`);
+        // Avantio uses id="buttonSendOtpToken" with type="button" — use JS click
+        // because Playwright's .click() fails visibility checks on this element
+        const clicked = await page.evaluate(() => {
+          const btn = document.getElementById('buttonSendOtpToken');
+          if (btn) { btn.click(); return true; }
+          const submit = document.querySelector('button[type="submit"], input[type="submit"]');
+          if (submit) { submit.click(); return true; }
+          return false;
+        }).catch(() => false);
+        if (clicked) {
+          log(`[${sessionId}] Clicked 2FA submit via JS`);
         } else {
-          await input.press('Enter');
+          log(`[${sessionId}] No submit button, submitting form via JS...`);
+          await page.evaluate(() => {
+            const form = document.querySelector('form');
+            if (form) form.submit();
+          }).catch(() => {});
         }
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
