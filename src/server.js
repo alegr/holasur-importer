@@ -74,7 +74,7 @@ app.post('/import/start', async (req, res) => {
     }
 
     const context = await chromium.launchPersistentContext(userDataDir, {
-      headless: false,
+      headless: true,
       args: [
         '--window-size=900,700',
         '--window-position=100,100',
