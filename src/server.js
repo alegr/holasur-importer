@@ -99,52 +99,22 @@ app.post('/import/start', async (req, res) => {
       error: null,
     });
 
-    // Navigate to Avantio and wait for ALL redirects to finish
+    // Respond immediately — navigation and login detection happen in the background
+    res.json({ sessionId, status: 'waiting_for_login' });
+
+    // Navigate to Avantio in the background
     log(`[${sessionId}] Navigating to ${AVANTIO_URL}...`);
-    await page.goto(AVANTIO_URL, { waitUntil: 'load', timeout: 30000 });
-    // Wait for any JS-based redirects to complete
-    await new Promise(r => setTimeout(r, 3000));
-    // If a redirect happened, wait for that page too
-    await page.waitForLoadState('load').catch(() => {});
+    await page.goto(AVANTIO_URL, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
+      log(`[${sessionId}] Navigation error (continuing): ${e.message}`);
+    });
+    // Brief wait for JS redirects
     await new Promise(r => setTimeout(r, 2000));
+    await page.waitForLoadState('load').catch(() => {});
 
     const finalUrl = page.url();
     log(`[${sessionId}] Settled on: ${finalUrl.substring(0, 80)}`);
 
-    // Check the actual page content, not just URL — the URL can have misleading params
-    const isOnDashboard = await page.evaluate(() => {
-      // Dashboard has the avantio-menu web component and module=Home in the actual module param
-      const url = new URL(window.location.href);
-      const module = url.searchParams.get('module');
-      return module === 'Home' || !!document.querySelector('avantio-menu');
-    }).catch(() => false);
-
-    if (isOnDashboard) {
-      log(`[${sessionId}] Already logged in, on dashboard.`);
-    } else {
-      // On the login page — wait for form to be stable, click the first input,
-      // and bring the browser window to front
-      log(`[${sessionId}] On login page, waiting for form...`);
-      try {
-        await page.waitForSelector('input', { timeout: 15000, state: 'visible' });
-        // Click the first visible text/email input to focus it
-        const inputs = await page.$$('input:visible');
-        for (const inp of inputs) {
-          const type = await inp.getAttribute('type');
-          if (!type || type === 'text' || type === 'email') {
-            await inp.click();
-            log(`[${sessionId}] Clicked login input (type=${type}).`);
-            break;
-          }
-        }
-        // Bring browser window to front
-        await page.bringToFront();
-      } catch {
-        log(`[${sessionId}] Could not focus login form.`);
-      }
-    }
-
-    // Start watching for login in the background
+    // Start watching for login
     // Dashboard token harvesting happens AFTER login is detected (not before)
     scraper.waitForLogin().then(async (loggedIn) => {
       const session = sessions.get(sessionId);
@@ -184,11 +154,12 @@ app.post('/import/start', async (req, res) => {
 
       session.status = 'logged_in';
     });
-
-    res.json({ sessionId, status: 'waiting_for_login' });
   } catch (err) {
     log(`Error starting session: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    // Only send error if we haven't responded yet
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
@@ -852,7 +823,9 @@ app.post('/import/:sessionId/login', async (req, res) => {
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await new Promise(r => setTimeout(r, 3000));
         const newUrl = page.url();
-        const is2FA = !newUrl.includes('module=Home');
+        const parsed2FA = new URL(newUrl);
+        const mod2FA = parsed2FA.searchParams.get('module');
+        const is2FA = mod2FA !== 'Home' && mod2FA !== 'Dashboard';
         return res.json({ status: is2FA ? 'needs_2fa' : 'logged_in', url: newUrl.substring(0, 80) });
       }
       return res.json({ status: 'error', error: 'No 2FA input found' });
@@ -878,8 +851,10 @@ app.post('/import/:sessionId/login', async (req, res) => {
       await new Promise(r => setTimeout(r, 3000));
       
       const newUrl = page.url();
-      const needs2FA = !newUrl.includes('module=Home') && !newUrl.includes('module=Dashboard');
-      const loggedIn = newUrl.includes('module=Home') || newUrl.includes('module=Dashboard');
+      const parsedNewUrl = new URL(newUrl);
+      const newModule = parsedNewUrl.searchParams.get('module');
+      const loggedIn = newModule === 'Home' || newModule === 'Dashboard';
+      const needs2FA = !loggedIn;
       
       // Take a screenshot to help debug
       const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
@@ -894,8 +869,13 @@ app.post('/import/:sessionId/login', async (req, res) => {
 
     // No credentials — just return current state + screenshot
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
+    // Use URLSearchParams to check the actual 'module' param, not substring match
+    // (login page URL contains return_module=Home which would false-positive)
+    const parsedUrl = new URL(url);
+    const moduleParam = parsedUrl.searchParams.get('module');
+    const isLoggedIn = moduleParam === 'Home' || moduleParam === 'Dashboard';
     return res.json({
-      status: url.includes('module=Home') ? 'logged_in' : 'needs_login',
+      status: isLoggedIn ? 'logged_in' : 'needs_login',
       url: url.substring(0, 80),
       screenshot: screenshot ? `data:image/jpeg;base64,${screenshot.toString('base64')}` : null
     });
