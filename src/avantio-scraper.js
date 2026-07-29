@@ -92,11 +92,6 @@ class AvantioScraper {
     log('Waiting for login...');
     this.status = 'waiting_for_login';
 
-    // Auto-login with env credentials if available
-    const avantioEmail = process.env.AVANTIO_EMAIL;
-    const avantioPassword = process.env.AVANTIO_PASSWORD;
-    let autoLoginAttempted = false;
-
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
@@ -113,43 +108,21 @@ class AvantioScraper {
           return true;
         }
 
-        // Auto-login: if we have credentials and haven't tried yet
-        if (avantioEmail && avantioPassword && !autoLoginAttempted) {
-          autoLoginAttempted = true;
-          log('Auto-login with env credentials...');
-          try {
-            // Wait for login form
-            const emailInput = await this.page.waitForSelector(
-              'input[name="user_name"], input[type="email"], input[name="email"]',
-              { timeout: 10000, state: 'visible' }
-            ).catch(() => null);
-
-            if (emailInput) {
-              await emailInput.fill(avantioEmail);
-              const passInput = await this.page.$('input[type="password"], input[name="user_password"]');
-              if (passInput) await passInput.fill(avantioPassword);
-              const submitBtn = await this.page.$('button[type="submit"], input[type="submit"], input[name="Login"]');
-              if (submitBtn) await submitBtn.click();
-              log('Credentials submitted, waiting for redirect...');
-              await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-              await delay(3000);
-              continue; // Re-check if logged in
-            }
-          } catch (e) {
-            log(`Auto-login error: ${e.message.substring(0, 60)}`);
-          }
+        // If not logged in, set status to needs_login so the UI can show the login form
+        if (this.status !== 'needs_login') {
+          this.status = 'needs_login';
+          log('Login required — waiting for credentials via /login endpoint...');
         }
 
-        // Check for 2FA page
+        // Check for 2FA page (specific text only)
         const is2FA = await this.page.evaluate(() => {
           const text = document.body?.textContent || '';
-          return text.includes('verification code') || text.includes('Two-step') || text.includes('2FA') || text.includes('Verify');
+          return text.includes('Two-step authentication enabled') || text.includes('Enter verification code');
         }).catch(() => false);
 
-        if (is2FA) {
-          log('2FA page detected. Waiting for code...');
+        if (is2FA && this.status !== 'needs_2fa') {
+          log('2FA required.');
           this.status = 'needs_2fa';
-          // Don't return — keep polling. The /login endpoint will submit the code.
         }
 
         // Alternative: check for a known post-login DOM element
