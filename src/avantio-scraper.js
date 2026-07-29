@@ -1000,6 +1000,123 @@ class AvantioScraper {
     return this.importPaymentsCSV('pending', 'List of payments to be made');
   }
 
+  async importInvoices() {
+    log('=== Importing Invoices via CSV ===');
+    this.status = 'importing';
+
+    // Try to find the invoices page in the sidebar menu
+    const menuLinks = ['Invoices', 'Invoice list', 'Facturas', 'Lista de facturas', 'Proformas'];
+    let navigated = false;
+
+    for (const linkText of menuLinks) {
+      const url = await this.page.evaluate((text) => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          if (a.textContent.trim() === text) return a.href;
+        }
+        return null;
+      }, linkText);
+
+      if (url) {
+        log(`  Found menu link: "${linkText}"`);
+        await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(5000);
+        navigated = true;
+        break;
+      }
+    }
+
+    if (!navigated) {
+      // Fallback: try navigating directly to the invoicing module
+      log('  No menu link found, trying direct navigation to Facturacion...');
+      const avsUrl = this._getSignedUrl('Facturacion', 'index');
+      if (avsUrl) {
+        await this.page.goto(avsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(5000);
+        navigated = true;
+      }
+    }
+
+    if (!navigated) {
+      log('  Could not navigate to invoices page. Dumping available menu links...');
+      const allLinks = await this.page.evaluate(() => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return [];
+        return Array.from(menu.shadowRoot.querySelectorAll('a'))
+          .map(a => a.textContent.trim())
+          .filter(t => t.length > 0);
+      }).catch(() => []);
+      log(`  Available menu links: ${JSON.stringify(allLinks)}`);
+      this.importResults.invoices = 0;
+      return [];
+    }
+
+    log(`  Arrived at ${this.page.url().substring(0, 100)}`);
+
+    // Try CSV download from the web component on the page
+    const wcSelectors = ['avantio-invoices-list', 'avantio-invoice-list', 'avantio-proforma-list'];
+    let rows = [];
+
+    for (const wc of wcSelectors) {
+      const exists = await this.page.$(wc);
+      if (exists) {
+        log(`  Found web component: ${wc}`);
+        rows = await this._downloadAndParseCSV(wc);
+        break;
+      }
+    }
+
+    // Fallback: try the old PHP page CSV export (like payments)
+    if (rows.length === 0) {
+      log('  No web component CSV, trying PHP page export...');
+      rows = await this._downloadPaymentsCSV().catch(() => []);
+    }
+
+    if (rows.length === 0) {
+      log('  No invoice data found.');
+      this.importResults.invoices = 0;
+      return [];
+    }
+
+    if (rows.length > 0) log(`  CSV columns: ${Object.keys(rows[0]).join(', ')}`);
+
+    // Map CSV columns to invoices schema
+    const records = rows.map(r => {
+      const record = { raw_data: r };
+
+      for (const [k, v] of Object.entries(r)) {
+        const kl = k.toLowerCase();
+        if (kl.includes('invoice') && kl.includes('number') || kl.includes('factura') && kl.includes('num')) record.invoice_number = v;
+        if (kl.includes('date') && !kl.includes('due') && !record.date) record.date = this._parseCSVDate(v) || v;
+        if (kl.includes('due') || kl.includes('vencimiento')) record.due_date = this._parseCSVDate(v) || v;
+        if (kl.includes('type') || kl.includes('tipo')) record.type = v;
+        if (kl.includes('status') || kl.includes('estado') || kl.includes('state')) record.status = v;
+        if (kl.includes('booking') || kl.includes('reservation') || kl.includes('reserva')) record.booking_reference = v;
+        if (kl.includes('property') || kl.includes('accommodation') || kl.includes('alojamiento')) record.property_code = v;
+        if (kl.includes('customer') || kl.includes('guest') || kl.includes('client') || kl.includes('cliente')) record.customer_name = v;
+        if (kl.includes('subtotal') || kl.includes('base')) record.subtotal = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+        if (kl.includes('tax') || kl.includes('iva') || kl.includes('impuesto')) record.tax_amount = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+        if ((kl.includes('total') && !kl.includes('sub')) || kl.includes('amount') || kl.includes('importe')) record.total = parseFloat((v || '').replace(/[^0-9.-]/g, '')) || 0;
+        if (kl.includes('currency') || kl.includes('moneda')) record.currency = v;
+        if (kl.includes('description') || kl.includes('concept') || kl.includes('descripcion')) record.description = v;
+      }
+
+      // Generate a unique ID
+      record.avantio_id = record.invoice_number ||
+        require('crypto').createHash('md5')
+          .update(`invoice-${record.date}-${record.total}-${record.customer_name || ''}`)
+          .digest('hex').substring(0, 16);
+
+      return record;
+    });
+
+    await this._postToLaravel('invoices', records);
+    this.importResults.invoices = records.length;
+    log(`  Imported ${records.length} invoices.`);
+    return records;
+  }
+
   async importPaymentsOutstanding() {
     log('=== Importing Outstanding Payments via CSV ===');
     this.status = 'importing';

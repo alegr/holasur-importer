@@ -240,6 +240,7 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     payments_made: () => session.scraper.importPaymentsMade(),
     payments_pending: () => session.scraper.importPaymentsToMake(),
     payments_outstanding: () => session.scraper.importPaymentsOutstanding(),
+    invoices: () => session.scraper.importInvoices(),
   };
 
   if (!methods[entity]) {
