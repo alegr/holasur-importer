@@ -817,16 +817,57 @@ app.post('/import/:sessionId/login', async (req, res) => {
       log(`[${sessionId}] Entering 2FA code...`);
 
       // Log the page state for debugging
+      const pageUrl = page.url();
       const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 500) || '').catch(() => '');
-      log(`[${sessionId}] 2FA page text: ${pageText.substring(0, 200)}`);
+      log(`[${sessionId}] 2FA page URL: ${pageUrl.substring(0, 120)}`);
+      log(`[${sessionId}] 2FA page text: ${pageText.substring(0, 300)}`);
+
+      // Dump all inputs on the page for debugging
+      const inputInfo = await page.evaluate(() => {
+        const inputs = Array.from(document.querySelectorAll('input'));
+        return inputs.map(i => ({
+          type: i.type, name: i.name, id: i.id, placeholder: i.placeholder,
+          visible: i.offsetParent !== null, autocomplete: i.autocomplete,
+        }));
+      }).catch(() => []);
+      log(`[${sessionId}] Page inputs: ${JSON.stringify(inputInfo)}`);
+
+      // Also check shadow DOM for inputs (Avantio uses web components)
+      const shadowInputs = await page.evaluate(() => {
+        const results = [];
+        document.querySelectorAll('*').forEach(el => {
+          if (el.shadowRoot) {
+            el.shadowRoot.querySelectorAll('input').forEach(i => {
+              results.push({
+                host: el.tagName.toLowerCase(), type: i.type, name: i.name,
+                id: i.id, placeholder: i.placeholder,
+              });
+            });
+          }
+        });
+        return results;
+      }).catch(() => []);
+      if (shadowInputs.length) log(`[${sessionId}] Shadow DOM inputs: ${JSON.stringify(shadowInputs)}`);
 
       // Try multiple selectors for the code input
-      const codeInput = await page.waitForSelector(
+      let input = await page.waitForSelector(
         'input[name*="code"], input[name*="otp"], input[name*="token"], input[autocomplete="one-time-code"], input[type="number"], input[type="tel"]',
-        { timeout: 5000 }
+        { timeout: 3000 }
       ).catch(() => null);
-      // Fallback: any visible text input on the 2FA page
-      const input = codeInput || await page.$('input[type="text"]:visible').catch(() => null);
+
+      // Fallback: any visible text input on the page
+      if (!input) {
+        const allInputs = await page.$$('input');
+        for (const inp of allInputs) {
+          const type = await inp.getAttribute('type').catch(() => '');
+          const visible = await inp.isVisible().catch(() => false);
+          if (visible && (!type || type === 'text' || type === 'number' || type === 'tel')) {
+            input = inp;
+            log(`[${sessionId}] Fallback: using visible input type=${type}`);
+            break;
+          }
+        }
+      }
 
       if (input) {
         await input.fill(code);
@@ -835,7 +876,6 @@ app.post('/import/:sessionId/login', async (req, res) => {
         if (submitBtn) {
           await submitBtn.click();
         } else {
-          // Try pressing Enter as fallback
           await input.press('Enter');
         }
         await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
@@ -850,7 +890,6 @@ app.post('/import/:sessionId/login', async (req, res) => {
             !!document.querySelector('#menu_lateral');
         }).catch(() => false);
 
-        // Check if there's an error message on the page (wrong code)
         const errorMsg = await page.evaluate(() => {
           const el = document.querySelector('.error, .alert-danger, .text-danger, [class*="error"]');
           return el?.textContent?.trim() || null;
@@ -862,8 +901,15 @@ app.post('/import/:sessionId/login', async (req, res) => {
         }
         return res.json({ status: 'needs_2fa', url: newUrl.substring(0, 80), error: errorMsg || 'Código incorrecto' });
       }
+
+      // Could not find any input — return screenshot for debugging
       log(`[${sessionId}] No 2FA input found on page`);
-      return res.json({ status: 'error', error: 'No se encontró el campo de verificación' });
+      const screenshot = await page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
+      return res.json({
+        status: 'needs_2fa',
+        error: 'No se encontró el campo de verificación. Intentá de nuevo.',
+        screenshot: screenshot ? `data:image/jpeg;base64,${screenshot.toString('base64')}` : null,
+      });
     }
 
     if (email && password) {

@@ -108,21 +108,22 @@ class AvantioScraper {
           return true;
         }
 
-        // If not logged in, set status to needs_login so the UI can show the login form
-        if (this.status !== 'needs_login') {
-          this.status = 'needs_login';
-          log('Login required — waiting for credentials via /login endpoint...');
-        }
-
-        // Check for 2FA page (specific text only)
+        // Check for 2FA page FIRST (specific text only) — must check before
+        // setting needs_login to avoid overwriting needs_2fa status
         const is2FA = await this.page.evaluate(() => {
           const text = document.body?.textContent || '';
           return text.includes('Two-step authentication enabled') || text.includes('Enter verification code');
         }).catch(() => false);
 
-        if (is2FA && this.status !== 'needs_2fa') {
-          log('2FA required.');
-          this.status = 'needs_2fa';
+        if (is2FA) {
+          if (this.status !== 'needs_2fa') {
+            log('2FA required.');
+            this.status = 'needs_2fa';
+          }
+        } else if (this.status !== 'needs_login' && this.status !== 'needs_2fa') {
+          // Only set needs_login if we're not already on 2FA
+          this.status = 'needs_login';
+          log('Login required — waiting for credentials via /login endpoint...');
         }
 
         // Alternative: check for a known post-login DOM element
