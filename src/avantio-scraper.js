@@ -1082,51 +1082,61 @@ class AvantioScraper {
 
     // Fallback: scrape HTML tables on the page
     if (rows.length === 0) {
-      log('  No web component CSV, scraping HTML tables...');
+      log('  No web component CSV, scraping Avantio invoices table...');
       rows = await this.page.evaluate(() => {
-        // Helper: get clean text content (no script/style)
-        function cleanText(el) {
-          const clone = el.cloneNode(true);
-          clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
-          return clone.textContent.trim();
-        }
-
-        // Find the main data table — look for one with a thead and multiple tbody rows
+        // Avantio's invoices table puts ALL data in a single <tr> as flat <td> cells
+        // Each invoice is a repeating group: [checkbox][checkbox][Number][Date][Accommodation][Client][Owner][Entry][Exit][Status][Total]
         const tables = document.querySelectorAll('table');
-        let bestTable = null;
-        let bestRowCount = 0;
-        for (const table of tables) {
-          const bodyRows = table.querySelectorAll('tbody tr');
-          if (bodyRows.length > bestRowCount) {
-            bestTable = table;
-            bestRowCount = bodyRows.length;
-          }
+        let best = null, bestCount = 0;
+        for (const t of tables) {
+          const r = t.querySelectorAll('tbody tr');
+          if (r.length > bestCount) { best = t; bestCount = r.length; }
         }
-        if (!bestTable || bestRowCount < 1) return [];
+        if (!best) return [];
 
-        // Extract headers from thead
-        const headerRow = bestTable.querySelector('thead tr');
-        if (!headerRow) return [];
-        const headers = Array.from(headerRow.querySelectorAll('th, td'))
-          .map(th => cleanText(th))
-          .filter(h => h.length > 0 && h.length < 50);
-        if (headers.length < 2) return [];
+        const firstRow = best.querySelector('tbody tr');
+        if (!firstRow) return [];
+        const tds = firstRow.querySelectorAll('td');
+        const cells = Array.from(tds).map(td => {
+          const clone = td.cloneNode(true);
+          clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+          return clone.textContent.replace(/\s+/g, ' ').trim();
+        });
 
-        // Extract data rows from tbody
+        // Deduplicate "text text" → "text"
+        function dedup(s) {
+          const parts = s.split(' ');
+          if (parts.length >= 2 && parts.length % 2 === 0) {
+            const half = parts.length / 2;
+            if (parts.slice(0, half).join(' ') === parts.slice(half).join(' '))
+              return parts.slice(0, half).join(' ');
+          }
+          return s;
+        }
+
+        // Skip junk cells until first booking number (7+ digits)
+        let i = 0;
+        while (i < cells.length && !/^\d{7,}/.test(cells[i])) i++;
+
         const results = [];
-        for (const row of bestTable.querySelectorAll('tbody tr')) {
-          const cells = row.querySelectorAll('td');
-          if (cells.length < 2) continue;
-          const record = {};
-          let hasData = false;
-          cells.forEach((cell, i) => {
-            if (i < headers.length) {
-              const val = cleanText(cell);
-              record[headers[i]] = val;
-              if (val.length > 0) hasData = true;
-            }
-          });
-          if (hasData) results.push(record);
+        while (i < cells.length) {
+          if (/^\d{7,}/.test(cells[i])) {
+            results.push({
+              'Number': dedup(cells[i] || ''),
+              'Invoice adding': cells[i+1] || '',
+              'Accommodation': dedup(cells[i+2] || '').replace(/\{[^}]+\}/g, '').trim(),
+              'Client/Guest': (cells[i+3] || '').replace(/\{[^}]+\}/g, '').trim(),
+              'Owner': dedup(cells[i+4] || ''),
+              'Invoice entry': cells[i+5] || '',
+              'Invoice exit': cells[i+6] || '',
+              'Status': cells[i+7] || '',
+              'Total': cells[i+8] || '',
+            });
+            i += 9;
+            while (i < cells.length && (cells[i] === 'No' || cells[i] === '')) i++;
+          } else {
+            i++;
+          }
         }
         return results;
       }).catch(() => []);

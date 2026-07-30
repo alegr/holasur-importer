@@ -781,6 +781,18 @@ const server = app.listen(PORT, () => {
   log('  POST /import/:id/stop        — close browser');
 });
 
+// GET /import/:sessionId/html — dump current page HTML for offline development
+app.get('/import/:sessionId/html', async (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const html = await session.page.content();
+    res.type('html').send(html);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Graceful shutdown — close browsers properly so cookies are flushed to disk
 async function shutdown() {
   log('Shutting down — closing browsers gracefully...');
