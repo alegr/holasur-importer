@@ -1082,64 +1082,102 @@ class AvantioScraper {
 
     // Fallback: scrape HTML tables on the page
     if (rows.length === 0) {
-      log('  No web component CSV, scraping Avantio invoices table...');
-      rows = await this.page.evaluate(() => {
-        // Avantio's invoices table puts ALL data in a single <tr> as flat <td> cells
-        // Each invoice is a repeating group: [checkbox][checkbox][Number][Date][Accommodation][Client][Owner][Entry][Exit][Status][Total]
-        const tables = document.querySelectorAll('table');
-        let best = null, bestCount = 0;
-        for (const t of tables) {
-          const r = t.querySelectorAll('tbody tr');
-          if (r.length > bestCount) { best = t; bestCount = r.length; }
-        }
-        if (!best) return [];
+      log('  No web component CSV, scraping Avantio invoices table with pagination...');
 
-        const firstRow = best.querySelector('tbody tr');
-        if (!firstRow) return [];
-        const tds = firstRow.querySelectorAll('td');
-        const cells = Array.from(tds).map(td => {
-          const clone = td.cloneNode(true);
-          clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
-          return clone.textContent.replace(/\s+/g, ' ').trim();
-        });
-
-        // Deduplicate "text text" → "text"
-        function dedup(s) {
-          const parts = s.split(' ');
-          if (parts.length >= 2 && parts.length % 2 === 0) {
-            const half = parts.length / 2;
-            if (parts.slice(0, half).join(' ') === parts.slice(half).join(' '))
-              return parts.slice(0, half).join(' ');
+      // Helper: scrape one page of the flat-cell invoices table
+      const scrapePage = async () => {
+        return this.page.evaluate(() => {
+          const tables = document.querySelectorAll('table');
+          let best = null, bestCount = 0;
+          for (const t of tables) {
+            const r = t.querySelectorAll('tbody tr');
+            if (r.length > bestCount) { best = t; bestCount = r.length; }
           }
-          return s;
-        }
+          if (!best) return { rows: [], hasNext: false };
 
-        // Skip junk cells until first booking number (7+ digits)
-        let i = 0;
-        while (i < cells.length && !/^\d{7,}/.test(cells[i])) i++;
+          const firstRow = best.querySelector('tbody tr');
+          if (!firstRow) return { rows: [], hasNext: false };
+          const tds = firstRow.querySelectorAll('td');
+          const cells = Array.from(tds).map(td => {
+            const clone = td.cloneNode(true);
+            clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+            return clone.textContent.replace(/\s+/g, ' ').trim();
+          });
 
-        const results = [];
-        while (i < cells.length) {
-          if (/^\d{7,}/.test(cells[i])) {
-            results.push({
-              'Number': dedup(cells[i] || ''),
-              'Invoice adding': cells[i+1] || '',
-              'Accommodation': dedup(cells[i+2] || '').replace(/\{[^}]+\}/g, '').trim(),
-              'Client/Guest': (cells[i+3] || '').replace(/\{[^}]+\}/g, '').trim(),
-              'Owner': dedup(cells[i+4] || ''),
-              'Invoice entry': cells[i+5] || '',
-              'Invoice exit': cells[i+6] || '',
-              'Status': cells[i+7] || '',
-              'Total': cells[i+8] || '',
-            });
-            i += 9;
-            while (i < cells.length && (cells[i] === 'No' || cells[i] === '')) i++;
-          } else {
-            i++;
+          function dedup(s) {
+            const parts = s.split(' ');
+            if (parts.length >= 2 && parts.length % 2 === 0) {
+              const half = parts.length / 2;
+              if (parts.slice(0, half).join(' ') === parts.slice(half).join(' '))
+                return parts.slice(0, half).join(' ');
+            }
+            return s;
           }
-        }
-        return results;
-      }).catch(() => []);
+
+          let i = 0;
+          while (i < cells.length && !/^\d{7,}/.test(cells[i])) i++;
+
+          const results = [];
+          while (i < cells.length) {
+            if (/^\d{7,}/.test(cells[i])) {
+              results.push({
+                'Number': dedup(cells[i] || ''),
+                'Invoice adding': cells[i+1] || '',
+                'Accommodation': dedup(cells[i+2] || '').replace(/\{[^}]+\}/g, '').trim(),
+                'Client/Guest': (cells[i+3] || '').replace(/\{[^}]+\}/g, '').trim(),
+                'Owner': dedup(cells[i+4] || ''),
+                'Invoice entry': cells[i+5] || '',
+                'Invoice exit': cells[i+6] || '',
+                'Status': cells[i+7] || '',
+                'Total': cells[i+8] || '',
+              });
+              i += 9;
+              while (i < cells.length && (cells[i] === 'No' || cells[i] === '')) i++;
+            } else {
+              i++;
+            }
+          }
+
+          // Check if there's a next page button
+          const pageInfo = document.body.textContent.match(/Page \d+ of (\d+)/);
+          const totalPages = pageInfo ? parseInt(pageInfo[1]) : 1;
+          const currentPage = document.body.textContent.match(/Page (\d+) of/);
+          const current = currentPage ? parseInt(currentPage[1]) : 1;
+          const hasNext = current < totalPages;
+
+          return { rows: results, hasNext, current, totalPages };
+        }).catch(() => ({ rows: [], hasNext: false }));
+      };
+
+      // Scrape all pages
+      let page = await scrapePage();
+      rows = [...page.rows];
+      log(`  Page ${page.current || 1}/${page.totalPages || '?'}: ${page.rows.length} invoices`);
+
+      while (page.hasNext) {
+        // Click next page button
+        const clicked = await this.page.evaluate(() => {
+          // Look for the ">" next page link
+          const links = document.querySelectorAll('a');
+          for (const a of links) {
+            if (a.textContent.trim() === '>' || a.textContent.trim() === '›') {
+              a.click();
+              return true;
+            }
+          }
+          // Try onclick pagination
+          const nextBtns = document.querySelectorAll('[onclick*="siguiente"], [onclick*="next"], .pagination .next a, a[title="Next"]');
+          if (nextBtns.length > 0) { nextBtns[0].click(); return true; }
+          return false;
+        }).catch(() => false);
+
+        if (!clicked) { log('  Could not find next page button'); break; }
+
+        await delay(3000);
+        page = await scrapePage();
+        rows = [...rows, ...page.rows];
+        log(`  Page ${page.current || '?'}/${page.totalPages || '?'}: ${page.rows.length} invoices (total: ${rows.length})`);
+      }
       if (rows.length > 0) log(`  Scraped ${rows.length} rows from HTML table`);
     }
 
