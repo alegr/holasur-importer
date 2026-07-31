@@ -565,7 +565,7 @@ class AvantioScraper {
       // Rate, Building, Photo gallery, Town, Area, ZIP, Street type, Address,
       // Building/house number, Staircase, Floor, Apartment, Owner, Registration Number
       record.avantio_id = r['Code'] || r['Property ID'] || r['ID'] || Object.values(r)[1];
-      record.name = r['Property'] || r['Property name'] || r['Name'] || '';
+      record.name = r['Accommodation'] || r['Property'] || r['Property name'] || r['Name'] || '';
       record.type = r['Type'] || r['Property type'] || null;
       record.location = r['Town'] || r['City'] || r['Location'] || null;
       record.status = (r['Status'] || 'Active').includes('Deactivated') ? 'Deactivated' : 'Active';
