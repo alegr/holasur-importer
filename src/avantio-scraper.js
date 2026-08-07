@@ -1765,31 +1765,34 @@ class AvantioScraper {
       await this.page.waitForLoadState('load').catch(() => {});
       await delay(2000);
 
-      // Navigate to the module's list via sidebar to get a valid avs token
-      const menuText = entityType === 'properties' ? 'List of properties' : 'Bookings';
-      const listUrl = await this.page.evaluate((text) => {
-        const menu = document.querySelector('avantio-menu');
-        if (!menu || !menu.shadowRoot) return null;
-        for (const a of menu.shadowRoot.querySelectorAll('a')) {
-          if (a.textContent.trim() === text) return a.href;
+      // Extract a valid avs for this module from redireccion() calls on the page
+      // These have freshly-signed tokens that work for the current session
+      const avsToken = await this.page.evaluate((mod) => {
+        const html = document.documentElement.outerHTML;
+        const regex = new RegExp(`redireccion\\('[^']*module=${mod}[^']*avs=([^&']+)`, 'g');
+        let match;
+        while ((match = regex.exec(html)) !== null) {
+          return match[1];
+        }
+        // Also try onclick attributes
+        for (const el of document.querySelectorAll('[onclick*="redireccion"]')) {
+          const onclick = el.getAttribute('onclick') || '';
+          if (onclick.includes(`module=${mod}`)) {
+            const avsMatch = onclick.match(/avs=([^&'"]+)/);
+            if (avsMatch) return avsMatch[1];
+          }
         }
         return null;
-      }, menuText);
+      }, module);
 
-      if (listUrl) {
-        await this.page.evaluate((url) => { window.location.href = url; }, listUrl);
-        await this.page.waitForURL(/module=/, { timeout: 15000 }).catch(() => {});
-        await delay(3000);
-      }
-
-      // Now construct the detail URL reusing the avs from the list page
-      const currentUrl = this.page.url();
-      const avsMatch = currentUrl.match(/avs=([^&]+)/);
-      if (avsMatch) {
-        const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView&avs=${avsMatch[1]}`;
-        log(`  Direct navigation to detail: record=${recordId}`);
-        await this.page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await delay(5000);
+      const avsMatch = avsToken ? [null, avsToken] : null;
+      // Navigate using window.location.href (preserves session cookies, unlike page.goto)
+      const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView`;
+      log(`  Direct navigation to detail: record=${recordId}`);
+      await this.page.evaluate((url) => { window.location.href = url; }, detailUrl);
+      await this.page.waitForURL(/record=.*DetailView|DetailView.*record=/, { timeout: 15000 }).catch(() => {});
+      await delay(5000);
+      {
         await delay(5000);
 
         if (this.page.url().includes('DetailView') && this.page.url().includes('record=')) {
@@ -1823,17 +1826,13 @@ class AvantioScraper {
         const records = body.data || [];
         const rec = records.find(r => String(r.avantio_id) === String(avantioId));
         if (rec) {
-          // For bookings, combine property name + check-in date for unique match
+          // For bookings, combine check-in date (YYYY-MM-DD) for matching
+          // Row text format: "2023-06-25 - 2023-06-30Property NameStatus..."
           if (entityType === 'bookings') {
             const parts = [];
-            if (rec.raw_data?.property_name) parts.push(rec.raw_data.property_name);
-            // Format check_in as "Feb 14 2027" to match Avantio's display
             if (rec.check_in) {
-              // Parse date string directly (avoid timezone shift from Date constructor)
-              const dateStr = String(rec.check_in).substring(0, 10); // "2027-02-14"
-              const [y, m, day] = dateStr.split('-');
-              const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-              parts.push(`${months[parseInt(m)]} ${parseInt(day)} ${y}`);
+              // Use YYYY-MM-DD format (matches Avantio's display)
+              parts.push(String(rec.check_in).substring(0, 10));
             }
             if (parts.length > 0) searchText = parts.join('|');
           }
@@ -1901,6 +1900,19 @@ class AvantioScraper {
       } catch { /* fall through to scrolling */ }
     }
 
+    // Debug: dump first row structure
+    const sampleRow = await this.page.evaluate(({ wcSel, rSel }) => {
+      const wc = document.querySelector(wcSel);
+      if (!wc || !wc.shadowRoot) return 'no shadow root';
+      const rows = wc.shadowRoot.querySelectorAll(rSel);
+      if (rows.length === 0) return 'no rows';
+      const row = rows[0];
+      const links = Array.from(row.querySelectorAll('a[href]')).map(a => a.href.substring(0, 100));
+      const buttons = Array.from(row.querySelectorAll('button')).map(b => ({ text: b.textContent.trim(), aria: b.getAttribute('aria-label') }));
+      return { text: row.textContent.replace(/\s+/g, ' ').trim().substring(0, 250), links, buttons, rowCount: rows.length };
+    }, { wcSel: wcSelector, rSel: rowSelector }).catch(e => e.message);
+    log(`  Sample row: ${JSON.stringify(sampleRow)}`);
+
     // Scroll until we find the row or exhaust the list
     log(`  Scrolling to find "${searchText.substring(0, 40)}"...`);
     let foundIndex = -1;
@@ -1911,29 +1923,29 @@ class AvantioScraper {
       await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await delay(2000);
 
-      const result = await this.page.evaluate(({ wcSel, rSel, search, aId }) => {
+      const result = await this.page.evaluate(({ wcSel, rSel, search, aId, recId }) => {
         const wc = document.querySelector(wcSel);
         if (!wc || !wc.shadowRoot) return { count: 0, found: -1 };
         const rows = wc.shadowRoot.querySelectorAll(rSel);
         let found = -1;
         for (let i = 0; i < rows.length; i++) {
           const text = rows[i].textContent;
-          // Match by avantio_id in text, or by ALL search parts (prop name + date)
+          // Match by record ID, full avantio_id, or ALL search parts (prop name + date)
           const searchParts = search.split('|');
           const allPartsMatch = searchParts.length > 0 && searchParts.every(p => text.includes(p));
-          if (text.includes(aId) || allPartsMatch) {
+          if (text.includes(recId) || text.includes(aId) || allPartsMatch) {
             found = i;
             break;
           }
-          // For properties, also check links for record=<id>
+          // Also check links for record=<id>
           const links = rows[i].querySelectorAll('a[href]');
           for (const a of links) {
-            if (a.href.includes(`record=${aId}`)) { found = i; break; }
+            if (a.href.includes(`record=${recId}`) || a.href.includes(`record=${aId}`)) { found = i; break; }
           }
           if (found >= 0) break;
         }
         return { count: rows.length, found };
-      }, { wcSel: wcSelector, rSel: rowSelector, search: searchText, aId: avantioId });
+      }, { wcSel: wcSelector, rSel: rowSelector, search: searchText, aId: avantioId, recId: recordId });
 
       if (result.found >= 0) {
         foundIndex = result.found;
@@ -2042,11 +2054,16 @@ class AvantioScraper {
 
       const postRes = await fetch(`${LARAVEL_API_BASE}/bookings/${booking.id}/services`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
         body: JSON.stringify({ data: parsed }),
       });
-      const result = await postRes.json();
-      log(`  Saved ${result.count || 0} services for booking ${avantioId}.`);
+      const text = await postRes.text();
+      try {
+        const result = JSON.parse(text);
+        log(`  Saved ${result.count || 0} services for booking ${avantioId}.`);
+      } catch {
+        log(`  Services API error (${postRes.status}): ${text.substring(0, 100)}`);
+      }
     } catch (err) {
       log(`  Error saving services: ${err.message}`);
     }

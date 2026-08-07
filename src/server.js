@@ -606,13 +606,13 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
       detail = await session.scraper.importOneDetail(entity);
     }
     res.json({ entity, detail, status: detail ? 'done' : 'no_data' });
-    // Auto-close browser after detail scrape
+    // Auto-close browser after detail scrape (wait longer for services to save)
     if (detail) {
       setTimeout(async () => {
         try { await session.browser.close(); } catch {}
         sessions.delete(sessionId);
         log(`[${sessionId}] Browser closed after detail scrape.`);
-      }, 2000);
+      }, 10000);
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -835,6 +835,12 @@ app.post('/import/:sessionId/login', async (req, res) => {
   try {
     const page = session.page;
     const url = page.url();
+
+    // If already logged in (e.g. waitForLogin detected it), don't touch the page
+    const scraperStatus = session.scraper?.status || session.status;
+    if (scraperStatus === 'logged_in' || scraperStatus === 'importing' || scraperStatus === 'done') {
+      return res.json({ status: 'logged_in', url: url.substring(0, 80) });
+    }
 
     if (code) {
       // 2FA code entry
