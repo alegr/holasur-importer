@@ -1942,14 +1942,58 @@ class AvantioScraper {
     await detailPage.close().catch(() => {});
 
     if (Object.keys(data).length > 5) {
-      log(`  Extracted ${Object.keys(data).length} fields.`);
+      log(`  Extracted ${Object.keys(data).length} fields, ${(data._services || []).length} services.`);
       const record = this._mapDetailToRecord(entityType, data);
       await this._postToLaravel(entityType, [record]);
+
+      // Save services if this is a booking and we found service line items
+      if (entityType === 'bookings' && data._services && data._services.length > 0) {
+        await this._saveBookingServices(avantioId, data._services);
+      }
+
       return data;
     }
 
     log(`  Too few fields (${Object.keys(data).length}).`);
     return null;
+  }
+
+  /**
+   * Save booking service line items to the API.
+   */
+  async _saveBookingServices(avantioId, services) {
+    try {
+      // Find the booking ID from avantio_id
+      const res = await fetch(`${LARAVEL_API_BASE}/bookings?search=${avantioId}`);
+      if (!res.ok) return;
+      const body = await res.json();
+      const bookings = body.data || [];
+      const booking = bookings.find(b => String(b.avantio_id) === String(avantioId));
+      if (!booking) { log(`  Could not find booking ${avantioId} for services.`); return; }
+
+      // Parse and post services
+      const parsed = services.map(s => ({
+        category: s.category || 'service',
+        concept: s.concept,
+        price_label: s.price_label,
+        quantity: s.quantity,
+        tax: s.tax,
+        total: parseFloat((s.total || '').replace(/[^0-9.-]/g, '')) || 0,
+        unit_price: parseFloat((s.price_label || '').replace(/[^0-9.-]/g, '')) || null,
+        currency: (s.total || '').includes('€') ? 'EUR' : 'USD',
+        charge_moment: s.charge_moment,
+      }));
+
+      const postRes = await fetch(`${LARAVEL_API_BASE}/bookings/${booking.id}/services`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: parsed }),
+      });
+      const result = await postRes.json();
+      log(`  Saved ${result.count || 0} services for booking ${avantioId}.`);
+    } catch (err) {
+      log(`  Error saving services: ${err.message}`);
+    }
   }
 
   /**
@@ -1970,6 +2014,44 @@ class AvantioScraper {
             result['_t_' + label] = value;
         }
       });
+
+      // Extract AMOUNTS table — services/extras line items
+      // Look for the table that has "Concept" and "Price" headers
+      const services = [];
+      for (const table of document.querySelectorAll('table')) {
+        const headerText = (table.querySelector('thead') || table.querySelector('tr'))?.textContent || '';
+        if (!headerText.includes('Concept') && !headerText.includes('Price')) continue;
+
+        const rows = table.querySelectorAll('tbody tr, tr');
+        for (const row of rows) {
+          const cells = row.querySelectorAll('td');
+          if (cells.length < 4) continue;
+          const cellTexts = Array.from(cells).map(c => c.textContent.trim().replace(/\s+/g, ' '));
+
+          // Skip header rows, total rows, and empty rows
+          const concept = cellTexts[0];
+          if (!concept || concept === 'Concept' || concept.includes('Total') || concept.includes('TOTAL')) continue;
+          if (concept === 'Paid' || concept === 'Pending') continue;
+
+          const isProperty = concept === 'Property' || concept === 'Propiedad';
+          const isService = concept.startsWith('-') || concept.startsWith('–');
+
+          if (isProperty || isService) {
+            services.push({
+              category: isProperty ? 'property' : 'service',
+              concept: concept.replace(/^[-–]\s*/, '').replace(/\s*\.{2,}\s*$/, '').trim(),
+              price_label: cellTexts[1] || null,
+              quantity: cellTexts[2] || null,
+              tax: cellTexts[3] || null,
+              total: cellTexts[4] || null,
+              charge_moment: cellTexts[5] || null,
+            });
+          }
+        }
+        if (services.length > 0) break; // Found the amounts table
+      }
+      result._services = services;
+
       const url = window.location.href;
       const m = url.match(/record=(\d+)/);
       if (m) result._recordId = m[1];
@@ -2020,6 +2102,11 @@ class AvantioScraper {
       const record = this._mapDetailToRecord(entityType, detail);
       await this._postToLaravel(entityType, [record]);
       this.importResults[`${entityType}_detail`] = 1;
+
+      // Save services if booking
+      if (entityType === 'bookings' && detail._services && detail._services.length > 0) {
+        await this._saveBookingServices(record.avantio_id, detail._services);
+      }
     }
     return detail;
   }
