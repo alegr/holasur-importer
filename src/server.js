@@ -20,8 +20,22 @@ app.use((req, res, next) => {
 const PORT = 3100;
 const AVANTIO_URL = 'https://app.avantio.pro';
 
-// Active sessions: sessionId -> { browser, context, page, scraper, status }
+// Active sessions: sessionId -> { browser, context, page, scraper, status, createdAt }
 const sessions = new Map();
+
+// Auto-cleanup stale sessions every 60 seconds
+setInterval(async () => {
+  for (const [id, session] of sessions) {
+    const age = Date.now() - (session.createdAt || 0);
+    const status = session.scraper?.status || session.status;
+    // Remove sessions that are errored/timed out, or older than 30 minutes
+    if (status === 'error' || age > 30 * 60 * 1000) {
+      log(`[${id}] Cleaning up stale session (status=${status}, age=${Math.round(age/1000)}s)`);
+      try { await session.browser.close(); } catch {}
+      sessions.delete(id);
+    }
+  }
+}, 60_000);
 
 // ---------------------------------------------------------------------------
 // GET /import/active
@@ -97,6 +111,7 @@ app.post('/import/start', async (req, res) => {
       scraper,
       status: 'waiting_for_login',
       error: null,
+      createdAt: Date.now(),
     });
 
     // Respond immediately — navigation and login detection happen in the background

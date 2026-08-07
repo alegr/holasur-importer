@@ -1754,11 +1754,66 @@ class AvantioScraper {
   async scrapeRecordDetail(entityType, avantioId) {
     log(`=== Scraping detail for ${entityType} record ${avantioId} ===`);
 
-    // For properties: avantio_id appears as text in the card (e.g. "671862")
-    // For bookings: avantio_id is only in the See button URL, not in row text/links.
-    //   We must find the row by matching dates+property from our DB.
+    // Extract the Avantio record ID (first part before any dash suffix)
+    const recordId = String(avantioId).split('-')[0];
 
-    // Get identifying info from our DB to help find the row
+    // Try direct navigation to the detail page first (much faster than searching the list)
+    const module = entityType === 'properties' ? 'Propiedades' : 'Compromisos';
+    try {
+      // Wait for page to settle
+      await delay(3000);
+      await this.page.waitForLoadState('load').catch(() => {});
+      await delay(2000);
+
+      // Navigate to the module's list via sidebar to get a valid avs token
+      const menuText = entityType === 'properties' ? 'List of properties' : 'Bookings';
+      const listUrl = await this.page.evaluate((text) => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          if (a.textContent.trim() === text) return a.href;
+        }
+        return null;
+      }, menuText);
+
+      if (listUrl) {
+        await this.page.evaluate((url) => { window.location.href = url; }, listUrl);
+        await this.page.waitForURL(/module=/, { timeout: 15000 }).catch(() => {});
+        await delay(3000);
+      }
+
+      // Now construct the detail URL reusing the avs from the list page
+      const currentUrl = this.page.url();
+      const avsMatch = currentUrl.match(/avs=([^&]+)/);
+      if (avsMatch) {
+        const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView&avs=${avsMatch[1]}`;
+        log(`  Direct navigation to detail: record=${recordId}`);
+        await this.page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(5000);
+        await delay(5000);
+
+        if (this.page.url().includes('DetailView') && this.page.url().includes('record=')) {
+          log(`  On detail page: ${this.page.url().substring(0, 80)}`);
+          const data = await this._extractDetailFromPage(this.page);
+          if (Object.keys(data).length > 5) {
+            log(`  Extracted ${Object.keys(data).length} fields, ${(data._services || []).length} services.`);
+            const record = this._mapDetailToRecord(entityType, data);
+            record.avantio_id = avantioId; // Keep original compound ID
+            await this._postToLaravel(entityType, [record]);
+
+            if (entityType === 'bookings' && data._services && data._services.length > 0) {
+              await this._saveBookingServices(avantioId, data._services);
+            }
+            return data;
+          }
+        }
+        log(`  Direct navigation failed, falling back to list search...`);
+      }
+    } catch (e) {
+      log(`  Direct navigation error: ${e.message}, falling back to list search...`);
+    }
+
+    // Fallback: search the list
     let searchText = avantioId;
     try {
       const entity = entityType === 'properties' ? 'properties' : 'bookings';
@@ -1805,7 +1860,8 @@ class AvantioScraper {
     const rowSelector = entityType === 'properties' ? '.alib-vertical-card' : '[data-testid="row-list"]';
 
     // Try the search box first (faster than scrolling)
-    const searchTerms = [avantioId];
+    // Use just the numeric part of compound IDs (e.g. "33344829" from "33344829-1744225814")
+    const searchTerms = [recordId, avantioId];
     // Also add booking reference from our DB if available
     try {
       const res = await fetch(`${LARAVEL_API.replace('/import', '')}/bookings?search=${avantioId}`);
