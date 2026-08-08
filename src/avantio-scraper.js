@@ -1786,12 +1786,78 @@ class AvantioScraper {
       }, module);
 
       const avsMatch = avsToken ? [null, avsToken] : null;
-      // Navigate using window.location.href (preserves session cookies, unlike page.goto)
-      const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView`;
-      log(`  Direct navigation to detail: record=${recordId}`);
-      await this.page.evaluate((url) => { window.location.href = url; }, detailUrl);
-      await this.page.waitForURL(/record=.*DetailView|DetailView.*record=/, { timeout: 15000 }).catch(() => {});
-      await delay(5000);
+      // Click "See" on ANY row to get a valid avs token for DetailView,
+      // then replace the record ID with our target
+      // First navigate to the bookings list via sidebar
+      const listMenuText = entityType === 'properties' ? 'List of properties' : 'Bookings';
+      const listNavUrl = await this.page.evaluate((text) => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          if (a.textContent.trim() === text) return a.href;
+        }
+        return null;
+      }, listMenuText);
+      if (listNavUrl) {
+        await this.page.evaluate((url) => { window.location.href = url; }, listNavUrl);
+        await this.page.waitForURL(/module=/, { timeout: 15000 }).catch(() => {});
+        await delay(5000);
+      }
+
+      log(`  Getting valid DetailView avs by clicking See on first row...`);
+      const wcSel = entityType === 'properties' ? 'avantio-accommodations-list' : 'avantio-bookings-list';
+      const rowSel = entityType === 'properties' ? '.alib-vertical-card' : '[data-testid="row-list"]';
+
+      // Wait for rows to load (web component needs time to render)
+      for (let w = 0; w < 15; w++) {
+        const count = await this.page.evaluate(({ wc, rs }) => {
+          const el = document.querySelector(wc);
+          return el && el.shadowRoot ? el.shadowRoot.querySelectorAll(rs).length : 0;
+        }, { wc: wcSel, rs: rowSel }).catch(() => 0);
+        if (count > 0) break;
+        await delay(2000);
+      }
+
+      // Click "See" on the first row to open a detail tab
+      const clicked = await this.page.evaluate(({ wc, rs }) => {
+        const el = document.querySelector(wc);
+        if (!el || !el.shadowRoot) return false;
+        const rows = el.shadowRoot.querySelectorAll(rs);
+        if (rows.length === 0) return false;
+        const btn = rows[0].querySelector('button[aria-label="See"]');
+        if (btn) { btn.click(); return true; }
+        return false;
+      }, { wc: wcSel, rs: rowSel });
+
+      log(`  See button click: ${clicked}`);
+      if (clicked) {
+        // Wait for detail tab to open
+        let templateTab = null;
+        for (let i = 0; i < 10; i++) {
+          await delay(1000);
+          for (const p of this.page.context().pages()) {
+            if (p.url().includes('action=DetailView') && p.url().includes('record=')) {
+              templateTab = p;
+              break;
+            }
+          }
+          if (templateTab) break;
+        }
+
+        if (templateTab) {
+          // Extract avs from the template URL and construct our target URL
+          const templateUrl = templateTab.url();
+          const avsMatch = templateUrl.match(/avs=([^&]+)/);
+          await templateTab.close().catch(() => {});
+
+          if (avsMatch) {
+            const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView&avs=${avsMatch[1]}`;
+            log(`  Direct navigation to detail: record=${recordId} (avs from template)`);
+            await this.page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await delay(5000);
+          }
+        }
+      }
       {
         await delay(5000);
 
@@ -1826,14 +1892,19 @@ class AvantioScraper {
         const records = body.data || [];
         const rec = records.find(r => String(r.avantio_id) === String(avantioId));
         if (rec) {
-          // For bookings, combine check-in date (YYYY-MM-DD) for matching
-          // Row text format: "2023-06-25 - 2023-06-30Property NameStatus..."
+          // For bookings, use check-in date in "D Mon YYYY" format (matches Avantio's display)
+          // Row text: "14 Aug 2026 - 17 Aug 2026Property NameStatus..."
           if (entityType === 'bookings') {
             const parts = [];
             if (rec.check_in) {
-              // Use YYYY-MM-DD format (matches Avantio's display)
-              parts.push(String(rec.check_in).substring(0, 10));
+              const dateStr = String(rec.check_in).substring(0, 10); // "2028-11-01"
+              const [y, m, day] = dateStr.split('-');
+              const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+              parts.push(`${parseInt(day)} ${months[parseInt(m)]} ${y}`);
             }
+            // Also add property name for more precise matching
+            const propName = rec.property?.name || rec.raw_data?._csv?.['Accommodation'] || rec.raw_data?.property_name || '';
+            if (propName) parts.push(propName.split(' | ')[0]); // First part of "Land Houses | Casa Molino | Hola Sur"
             if (parts.length > 0) searchText = parts.join('|');
           }
         }
@@ -1877,27 +1948,43 @@ class AvantioScraper {
     for (const term of searchTerms) {
       log(`  Trying search box for "${term}"...`);
       try {
-        const searchInput = this.page.locator(`${wcSelector} >> input[placeholder*="Search"]`);
-        if (await searchInput.count() > 0) {
-          await searchInput.fill('');
-          await searchInput.type(term, { delay: 50 });
-          await this.page.keyboard.press('Enter');
-          await delay(4000);
+        // Use page.evaluate to find and fill the search input inside shadow DOM
+        const searched = await this.page.evaluate(({ wcSel, searchTerm }) => {
+          const wc = document.querySelector(wcSel);
+          if (!wc || !wc.shadowRoot) return false;
+          const input = wc.shadowRoot.querySelector('input[placeholder*="Search"], input[placeholder*="search"], input[type="search"]');
+          if (!input) return false;
+          // Clear and type
+          input.value = '';
+          input.value = searchTerm;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+          return true;
+        }, { wcSel: wcSelector, searchTerm: term });
+
+        if (searched) {
+          log(`  Search submitted for "${term}"`);
+          await delay(5000);
           // Check if results filtered
           const count = await this.page.evaluate(({ wc, rs }) => {
             const el = document.querySelector(wc);
             return el && el.shadowRoot ? el.shadowRoot.querySelectorAll(rs).length : 0;
           }, { wc: wcSelector, rs: rowSelector }).catch(() => 0);
-          if (count > 0 && count < 10) {
-            log(`  Search returned ${count} results.`);
-            break;
-          }
+          log(`  Search returned ${count} results`);
+          if (count > 0 && count < 20) break;
           // Clear search if it didn't filter
-          await searchInput.fill('');
-          await this.page.keyboard.press('Enter');
-          await delay(2000);
+          await this.page.evaluate((wcSel) => {
+            const wc = document.querySelector(wcSel);
+            if (!wc || !wc.shadowRoot) return;
+            const input = wc.shadowRoot.querySelector('input[placeholder*="Search"], input[type="search"]');
+            if (input) { input.value = ''; input.dispatchEvent(new Event('input', { bubbles: true })); }
+          }, wcSelector);
+          await delay(3000);
+        } else {
+          log(`  No search input found in ${wcSelector}`);
         }
-      } catch { /* fall through to scrolling */ }
+      } catch (e) { log(`  Search error: ${e.message}`); }
     }
 
     // Debug: dump first row structure
@@ -2032,9 +2119,17 @@ class AvantioScraper {
   async _saveBookingServices(avantioId, services) {
     try {
       // Find the booking ID from avantio_id
-      const res = await fetch(`${LARAVEL_API_BASE}/bookings?search=${avantioId}`);
-      if (!res.ok) return;
-      const body = await res.json();
+      const searchUrl = `${LARAVEL_API_BASE}/bookings?search=${avantioId}`;
+      log(`  Raw services: ${JSON.stringify(services.slice(0, 2))}`);
+      log(`  Searching booking: ${searchUrl}`);
+      const res = await fetch(searchUrl, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) { log(`  Search failed: ${res.status}`); return; }
+      const searchText = await res.text();
+      let body;
+      try { body = JSON.parse(searchText); } catch {
+        log(`  Search response not JSON (${res.status}): ${searchText.substring(0, 100)}`);
+        return;
+      }
       const bookings = body.data || [];
       const booking = bookings.find(b => String(b.avantio_id) === String(avantioId));
       if (!booking) { log(`  Could not find booking ${avantioId} for services.`); return; }
@@ -2052,6 +2147,7 @@ class AvantioScraper {
         charge_moment: s.charge_moment,
       }));
 
+      log(`  Posting ${parsed.length} services to booking ${booking.id}...`);
       const postRes = await fetch(`${LARAVEL_API_BASE}/bookings/${booking.id}/services`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -2089,19 +2185,24 @@ class AvantioScraper {
       });
 
       // Extract AMOUNTS table — services/extras line items
-      // Look for the table that has "Concept" and "Price" headers
+      // Helper: get clean text without scripts/styles
+      function cleanCellText(el) {
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+        return clone.textContent.trim().replace(/\s+/g, ' ');
+      }
+
       const services = [];
       for (const table of document.querySelectorAll('table')) {
-        const headerText = (table.querySelector('thead') || table.querySelector('tr'))?.textContent || '';
+        const headerText = cleanCellText(table.querySelector('thead') || table.querySelector('tr') || table);
         if (!headerText.includes('Concept') && !headerText.includes('Price')) continue;
 
         const rows = table.querySelectorAll('tbody tr, tr');
         for (const row of rows) {
           const cells = row.querySelectorAll('td');
           if (cells.length < 4) continue;
-          const cellTexts = Array.from(cells).map(c => c.textContent.trim().replace(/\s+/g, ' '));
+          const cellTexts = Array.from(cells).map(c => cleanCellText(c));
 
-          // Skip header rows, total rows, and empty rows
           const concept = cellTexts[0];
           if (!concept || concept === 'Concept' || concept.includes('Total') || concept.includes('TOTAL')) continue;
           if (concept === 'Paid' || concept === 'Pending') continue;
@@ -2110,18 +2211,25 @@ class AvantioScraper {
           const isService = concept.startsWith('-') || concept.startsWith('–');
 
           if (isProperty || isService) {
+            // Strip inline JS tooltips: "Final Cleaning $(function()..." → "Final Cleaning"
+            const cleanConcept = concept
+              .replace(/^[-–]\s*/, '')
+              .replace(/\s*\$\(function\(\).*$/, '')
+              .replace(/\s*\.{3,}\s*Price per unit:.*$/, '')
+              .replace(/\s*\.{2,}\s*$/, '')
+              .trim();
             services.push({
               category: isProperty ? 'property' : 'service',
-              concept: concept.replace(/^[-–]\s*/, '').replace(/\s*\.{2,}\s*$/, '').trim(),
-              price_label: cellTexts[1] || null,
-              quantity: cellTexts[2] || null,
-              tax: cellTexts[3] || null,
-              total: cellTexts[4] || null,
-              charge_moment: cellTexts[5] || null,
+              concept: cleanConcept,
+              price_label: (cellTexts[1] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
+              quantity: (cellTexts[2] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
+              tax: (cellTexts[3] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
+              total: (cellTexts[4] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
+              charge_moment: (cellTexts[5] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
             });
           }
         }
-        if (services.length > 0) break; // Found the amounts table
+        if (services.length > 0) break;
       }
       result._services = services;
 

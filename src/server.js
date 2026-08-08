@@ -598,7 +598,13 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
 
+  // Prevent double-triggering
+  if (session.scraper.status === 'importing') {
+    return res.json({ entity, status: 'importing', message: 'Detail scrape already in progress.' });
+  }
+
   try {
+    session.scraper.status = 'importing';
     let detail;
     if (avantioId) {
       detail = await session.scraper.scrapeRecordDetail(entity, avantioId);
@@ -794,6 +800,65 @@ const server = app.listen(PORT, () => {
   log('  POST /import/:id/status      — check status');
   log('  POST /import/:id/run         — start import (after login)');
   log('  POST /import/:id/stop        — close browser');
+});
+
+// POST /import/:sessionId/eval — run arbitrary JS on the page (for debugging)
+app.post('/import/:sessionId/eval', async (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const code = req.body?.code;
+    if (!code) return res.status(400).json({ error: 'No code provided.' });
+    const fn = new Function(`return (async () => { ${code} })()`);
+    const result = await session.page.evaluate(fn);
+    res.json({ result });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
+// POST /import/:sessionId/goto — navigate the page
+app.post('/import/:sessionId/goto', async (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const url = req.body?.url;
+    const useEval = req.body?.useEval; // use window.location.href instead of page.goto
+    if (useEval) {
+      await session.page.evaluate((u) => { window.location.href = u; }, url);
+    } else {
+      await session.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
+    await new Promise(r => setTimeout(r, 3000));
+    const currentUrl = session.page.url();
+    res.json({ url: currentUrl, hasError: currentUrl.includes('error=') });
+  } catch (err) {
+    res.json({ error: err.message, url: session.page.url() });
+  }
+});
+
+// POST /import/:sessionId/screenshot — take a screenshot
+app.post('/import/:sessionId/screenshot', async (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const buf = await session.page.screenshot({ type: 'jpeg', quality: 50 });
+    res.type('jpeg').send(buf);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /import/:sessionId/pages — list all open tabs/pages
+app.post('/import/:sessionId/pages', async (req, res) => {
+  const session = sessions.get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  try {
+    const pages = session.page.context().pages().map(p => p.url());
+    res.json({ pages });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
 });
 
 // GET /import/:sessionId/html — dump current page HTML for offline development
