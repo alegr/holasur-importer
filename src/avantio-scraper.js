@@ -1754,8 +1754,69 @@ class AvantioScraper {
   async scrapeRecordDetail(entityType, avantioId) {
     log(`=== Scraping detail for ${entityType} record ${avantioId} ===`);
 
-    // Extract the Avantio record ID (first part before any dash suffix)
     const recordId = String(avantioId).split('-')[0];
+
+    // Use AJAX API to find the booking and get a signed detail URL
+    if (entityType === 'bookings') {
+      try {
+        await delay(3000);
+        await this.page.waitForLoadState('load').catch(() => {});
+
+        // Make sure we're on an Avantio page (needed for fetch with session cookies)
+        if (!this.page.url().includes('avantio.pro')) {
+          await this.page.goto(AVANTIO_BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await delay(3000);
+        }
+
+        log(`  AJAX search for locator ${avantioId}...`);
+        const searchResult = await this.page.evaluate(async (locator) => {
+          const fd = new FormData();
+          fd.append('module', 'Compromisos');
+          fd.append('action', 'Ajax');
+          fd.append('functionName', 'fetchBookings');
+          fd.append('params', JSON.stringify({
+            sort: 'DATE_CREATION_DESC',
+            status: ['UNPAID', 'CONFIRMADA', 'CANCELLED', 'PETICIONES_REVISAR', 'PETICIONES_DESESTIMADA', 'BAJOPETICION', 'PROPIETARIO', 'UNAVAILABLE', 'PAID', 'CONFLICTED'],
+            manual_search: true,
+            locator: locator,
+            limit: 5,
+            offset: 0,
+          }));
+          const r = await fetch(location.origin + '/index.php', { method: 'POST', body: fd });
+          return r.json();
+        }, recordId);
+
+        const booking = searchResult.data?.[0];
+        if (booking && booking.routes?.detail) {
+          log(`  Found booking ${booking.id}: ${booking.propertyName}`);
+          log(`  Navigating to detail page...`);
+
+          await this.page.goto(booking.routes.detail, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await delay(8000);
+
+          if (!this.page.url().includes('error=')) {
+            log(`  On detail page: ${this.page.url().substring(0, 80)}`);
+            const data = await this._extractDetailFromPage(this.page);
+
+            if (Object.keys(data).length > 5) {
+              log(`  Extracted ${Object.keys(data).length} fields, ${(data._services || []).length} services.`);
+              const record = this._mapDetailToRecord(entityType, data);
+              record.avantio_id = avantioId;
+              await this._postToLaravel(entityType, [record]);
+              return data;
+            }
+          } else {
+            log(`  Detail page returned error: ${this.page.url().substring(0, 100)}`);
+          }
+        } else {
+          log(`  Booking not found via AJAX search`);
+        }
+      } catch (e) {
+        log(`  AJAX detail scrape error: ${e.message}`);
+      }
+    }
+
+    // Fallback for properties or if AJAX approach failed
 
     // Try direct navigation to the detail page first (much faster than searching the list)
     const module = entityType === 'properties' ? 'Propiedades' : 'Compromisos';
@@ -2215,8 +2276,8 @@ class AvantioScraper {
             const cleanConcept = concept
               .replace(/^[-–]\s*/, '')
               .replace(/\s*\$\(function\(\).*$/, '')
-              .replace(/\s*\.{3,}\s*Price per unit:.*$/, '')
-              .replace(/\s*\.{2,}\s*$/, '')
+              .replace(/\s*[.…]{2,}\s*Price per unit:.*$/, '')
+              .replace(/\s*[.…]{2,}\s*$/, '')
               .trim();
             services.push({
               category: isProperty ? 'property' : 'service',
