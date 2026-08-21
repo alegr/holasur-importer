@@ -29,7 +29,7 @@ setInterval(async () => {
     const age = Date.now() - (session.createdAt || 0);
     const status = session.scraper?.status || session.status;
     // Remove sessions that are errored/timed out, or older than 30 minutes
-    if (status === 'error' || age > 30 * 60 * 1000) {
+    if (status === 'error' || (status !== 'importing' && age > 30 * 60 * 1000) || age > 60 * 60 * 1000) {
       log(`[${id}] Cleaning up stale session (status=${status}, age=${Math.round(age/1000)}s)`);
       try { await session.browser.close(); } catch {}
       sessions.delete(id);
@@ -89,9 +89,11 @@ app.post('/import/start', async (req, res) => {
 
     const context = await chromium.launchPersistentContext(userDataDir, {
       headless: true,
+      locale: 'es-ES',
       args: [
         '--window-size=900,700',
         '--window-position=100,100',
+        '--lang=es-ES',
         // Use the profile directory for password storage (not mock keychain)
         '--password-store=basic',
         '--enable-features=PasswordManager,PasswordManagerOnboarding',
@@ -256,6 +258,7 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     payments_pending: () => session.scraper.importPaymentsToMake(),
     payments_outstanding: () => session.scraper.importPaymentsOutstanding(),
     invoices: () => session.scraper.importInvoices(),
+    service_catalog: () => session.scraper.importServiceCatalog(),
   };
 
   if (!methods[entity]) {

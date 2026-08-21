@@ -1008,6 +1008,181 @@ class AvantioScraper {
     return this.importPaymentsCSV('pending', 'List of payments to be made');
   }
 
+  /**
+   * Switch Avantio's language to Spanish (ES).
+   * The language selector is in the top bar — click the flag icon, then select Spanish.
+   */
+  async setLanguageSpanish() {
+    log('  Setting Avantio language to Spanish...');
+    try {
+      const switched = await this.page.evaluate(() => {
+        // Look for language links/buttons in the page
+        // Avantio uses a dropdown with language options
+        const langLinks = document.querySelectorAll('a[href*="idioma=ES"], a[href*="language=ES"], a[hreflang="es"], [onclick*="idioma"][onclick*="ES"]');
+        for (const link of langLinks) {
+          link.click();
+          return 'clicked language link';
+        }
+        // Try the flag/language selector in the top bar
+        const flags = document.querySelectorAll('img[src*="flag"], img[src*="lang"], .language-selector');
+        for (const flag of flags) {
+          flag.click();
+          return 'clicked flag';
+        }
+        // Try setting via URL parameter
+        const url = new URL(window.location.href);
+        url.searchParams.set('idioma', 'ES');
+        window.location.href = url.toString();
+        return 'url redirect';
+      });
+      log(`  Language switch: ${switched}`);
+      await delay(3000);
+      await this.page.waitForLoadState('load').catch(() => {});
+    } catch (e) {
+      log(`  Language switch failed: ${e.message}`);
+    }
+  }
+
+  async importServiceCatalog() {
+    log('=== Importing Service Catalog from Avantio ===');
+    this.status = 'importing';
+
+    // Wait for page to settle
+    await delay(3000);
+    await this.page.waitForLoadState('load').catch(() => {});
+    await delay(2000);
+
+    // Switch to Spanish
+    await this.setLanguageSpanish();
+
+    // Navigate to the first property's detail page to access the Extras tab
+    // Use AJAX to find a property
+    log('  Finding a property to read extras from...');
+    const navResult = await this.page.evaluate(() => {
+      const menu = document.querySelector('avantio-menu');
+      if (!menu || !menu.shadowRoot) return 'no menu';
+      for (const a of menu.shadowRoot.querySelectorAll('a')) {
+        const text = a.textContent.trim();
+        if (a.href.includes('ListViewPropiedades')) {
+          window.location.href = a.href;
+          return 'navigating: ' + text;
+        }
+      }
+      return 'no link found';
+    });
+    log(`  Sidebar nav: ${navResult}`);
+    await this.page.waitForURL(/Propiedades/, { timeout: 15000 }).catch(() => {});
+    await delay(8000);
+
+    // Wait for property list web component to load, then click "See" on first property
+    log(`  On page: ${this.page.url().substring(0, 80)}`);
+    log('  Waiting for property list...');
+    for (let i = 0; i < 20; i++) {
+      const info = await this.page.evaluate(() => {
+        const wc = document.querySelector('avantio-accommodations-list');
+        if (!wc) return { wc: false, cards: 0 };
+        if (!wc.shadowRoot) return { wc: true, shadow: false, cards: 0 };
+        const cards = wc.shadowRoot.querySelectorAll('.alib-vertical-card');
+        const rows = wc.shadowRoot.querySelectorAll('[data-testid="row-list"]');
+        return { wc: true, shadow: true, cards: cards.length, rows: rows.length };
+      }).catch(() => ({ error: true }));
+      if (i % 5 === 0) log(`  Poll ${i}: ${JSON.stringify(info)}`);
+      if (info.cards > 0 || info.rows > 0) { log(`  ${info.cards || info.rows} properties loaded`); break; }
+      await delay(2000);
+    }
+
+    // Click "See"/"Ver" on first property to open detail
+    const clicked = await this.page.evaluate(() => {
+      const wc = document.querySelector('avantio-accommodations-list');
+      if (!wc?.shadowRoot) return false;
+      const cards = wc.shadowRoot.querySelectorAll('.alib-vertical-card');
+      if (cards.length === 0) return false;
+      // Try both English and Spanish aria-labels
+      const btn = cards[0].querySelector('button[aria-label="See"], button[aria-label="Ver"]');
+      if (btn) { btn.click(); return true; }
+      // Fallback: any button with an external-link icon
+      const anyBtn = cards[0].querySelector('button:last-of-type, a[target="_blank"]');
+      if (anyBtn) { anyBtn.click(); return true; }
+      return false;
+    });
+
+    if (!clicked) {
+      log('  Could not click See on first property');
+      this.importResults.service_catalog = 0;
+      return [];
+    }
+
+    // Wait for detail tab
+    let detailPage = null;
+    for (let i = 0; i < 15; i++) {
+      await delay(1000);
+      for (const p of this.page.context().pages()) {
+        if (p.url().includes('action=DetailView') && p.url().includes('module=Propiedades')) {
+          detailPage = p;
+          break;
+        }
+      }
+      if (detailPage) break;
+    }
+
+    if (!detailPage) {
+      log('  No property detail tab opened');
+      this.importResults.service_catalog = 0;
+      return [];
+    }
+
+    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    log(`  On property detail: ${detailPage.url().substring(0, 80)}`);
+    await delay(3000);
+
+    // The extras/services are already on the property detail page
+    // in div elements with class "row__attribute extra--name"
+    // No tab click needed — they're loaded with the main page
+    log('  Scraping services list from extras section...');
+    const services = await detailPage.evaluate(() => {
+      const results = [];
+      // Primary method: use the specific CSS class for extra names
+      const extraDivs = document.querySelectorAll('.extra--name, [class*="extra--name"]');
+      for (const div of extraDivs) {
+        const clone = div.cloneNode(true);
+        clone.querySelectorAll('script, style, noscript').forEach(s => s.remove());
+        let name = clone.textContent.trim().replace(/\s+/g, ' ');
+        name = name.replace(/\$\(function\(\).*$/, '').replace(/\s*[.…]{2,}\s*$/, '').trim();
+        if (!name || name.length > 100 || name.length < 2) continue;
+        if (name.toUpperCase() === 'SERVICE' || name.toUpperCase() === 'SERVICIO') continue;
+        if (name.includes('xajax') || name.includes('function(')) continue;
+        results.push({ name });
+      }
+      return results;
+    });
+
+    await detailPage.close().catch(() => {});
+
+    if (services.length === 0) {
+      log('  No services found on Extras tab');
+      this.importResults.service_catalog = 0;
+      return [];
+    }
+
+    log(`  Found ${services.length} services. Sending to API...`);
+
+    // Post to Laravel
+    try {
+      const res = await fetch(`${LARAVEL_API_BASE}/service-catalog/import-avantio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ data: services }),
+      });
+      const result = await res.json();
+      log(`  Imported: ${result.created} new, ${result.updated} updated`);
+      this.importResults.service_catalog = result.created + result.updated;
+    } catch (e) {
+      log(`  Error saving catalog: ${e.message}`);
+    }
+
+    return services;
+  }
+
   async importInvoices() {
     log('=== Importing Invoices via CSV ===');
     this.status = 'importing';
@@ -1768,6 +1943,9 @@ class AvantioScraper {
           await delay(3000);
         }
 
+        // Switch to Spanish for service names
+        await this.setLanguageSpanish();
+
         log(`  AJAX search for locator ${avantioId}...`);
         const searchResult = await this.page.evaluate(async (locator) => {
           const fd = new FormData();
@@ -1803,6 +1981,7 @@ class AvantioScraper {
               const record = this._mapDetailToRecord(entityType, data);
               record.avantio_id = avantioId;
               await this._postToLaravel(entityType, [record]);
+
               return data;
             }
           } else {
@@ -2122,8 +2301,11 @@ class AvantioScraper {
       if (!wc || !wc.shadowRoot) return false;
       const rows = wc.shadowRoot.querySelectorAll(rSel);
       if (idx >= rows.length) return false;
-      const btn = rows[idx].querySelector('button[aria-label="See"]');
+      const btn = rows[idx].querySelector('button[aria-label="See"], button[aria-label="Ver"]');
       if (btn) { btn.click(); return true; }
+      // Fallback: last button in the row
+      const anyBtn = rows[idx].querySelector('button:last-of-type');
+      if (anyBtn) { anyBtn.click(); return true; }
       return false;
     }, { wcSel: wcSelector, rSel: rowSelector, idx: foundIndex });
 
@@ -2155,6 +2337,13 @@ class AvantioScraper {
     await delay(5000);
 
     const data = await this._extractDetailFromPage(detailPage);
+
+    // For properties: scrape services list and contract commission before closing
+    if (entityType === 'properties') {
+      await this._scrapePropertyServices(detailPage, avantioId);
+      await this._scrapePropertyCommission(detailPage, avantioId);
+    }
+
     await detailPage.close().catch(() => {});
 
     if (Object.keys(data).length > 5) {
@@ -2177,6 +2366,231 @@ class AvantioScraper {
   /**
    * Save booking service line items to the API.
    */
+  /**
+   * Scrape HS commission % from a property's contract page.
+   * Flow: current page (booking detail) → property link → contract link → extract %
+   */
+  /**
+   * Scrape HS commission % from the property's contract page.
+   * Called from property detail page — follows contract link → extracts %.
+   */
+  /**
+   * Scrape the property's applicable services from the Extras/Services section.
+   * These are the div.extra--name elements on the property detail page.
+   */
+  async _scrapePropertyServices(page, avantioPropertyId) {
+    try {
+      log('  Scraping property services...');
+      const services = await page.evaluate(() => {
+        const results = [];
+        // The extras are in div elements with class "extra--name"
+        // Each service row also has "extra--applicable" and "extra--personalized" siblings
+        const rows = document.querySelectorAll('[class*="row__extras"], [class*="extra-row"], tr');
+
+        // Try the div-based layout first (web component)
+        const extraNames = document.querySelectorAll('.extra--name, [class*="extra--name"]');
+        if (extraNames.length > 0) {
+          extraNames.forEach(div => {
+            const clone = div.cloneNode(true);
+            clone.querySelectorAll('script, style').forEach(s => s.remove());
+            const name = clone.textContent.trim().replace(/\s+/g, ' ')
+              .replace(/\$\(function\(\).*$/, '').replace(/\s*[.…]{2,}\s*$/, '').trim();
+            if (!name || name === 'SERVICE' || name === 'SERVICIO' || name.length > 100 || name.length < 2) return;
+
+            // Try to find applicable/personalized in sibling divs
+            const parent = div.parentElement;
+            const siblings = parent ? parent.querySelectorAll('[class*="extra--"]') : [];
+            let applicable = false;
+            let personalized = false;
+            siblings.forEach(sib => {
+              const cls = sib.className || '';
+              const text = sib.textContent.trim().toLowerCase();
+              if (cls.includes('applicable') || cls.includes('aplicable')) {
+                applicable = text.includes('yes') || text.includes('sí') || text.includes('si');
+              }
+              if (cls.includes('personali')) {
+                personalized = text.includes('yes') || text.includes('sí') || text.includes('si');
+              }
+            });
+
+            results.push({ name, applicable, personalized });
+          });
+        }
+        return results;
+      });
+
+      if (services.length === 0) {
+        log('  No property services found');
+        return;
+      }
+
+      log(`  Found ${services.length} property services`);
+
+      // Find property in DB
+      const propRes = await fetch(`${LARAVEL_API_BASE}/properties/by-avantio-id/${avantioPropertyId}`, {
+        headers: { 'Accept': 'application/json' },
+      });
+      if (!propRes.ok) return;
+      const prop = await propRes.json();
+
+      // Save services
+      for (const svc of services) {
+        // Link to service catalog
+        const catalogRes = await fetch(`${LARAVEL_API_BASE}/service-catalog`, { headers: { 'Accept': 'application/json' } });
+        const catalog = await catalogRes.json();
+        const catMatch = catalog.find(c => c.name === svc.name);
+
+        try {
+          // Upsert: update if exists, create if not
+          const body = {
+            property_id: prop.id,
+            service_catalog_id: catMatch?.id || null,
+            name: svc.name,
+            is_applicable: svc.applicable,
+            is_personalized: svc.personalized,
+            is_from_avantio: true,
+          };
+
+          await fetch(`${LARAVEL_API_BASE}/properties/${prop.id}/services`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(body),
+          });
+        } catch { /* skip */ }
+      }
+
+      log(`  Saved ${services.length} property services`);
+    } catch (e) {
+      log(`  Property services scrape error: ${e.message}`);
+    }
+  }
+
+  async _scrapePropertyCommission(page, avantioPropertyId) {
+    if (!avantioPropertyId) return;
+
+    try {
+      // Find contract link on the property detail page
+      const contractUrl = await page.evaluate(() => {
+        for (const a of document.querySelectorAll('a')) {
+          if (a.href.includes('module=Contratos') && a.href.includes('DetailView')) return a.href;
+        }
+        return null;
+      });
+      if (!contractUrl) { log('  No contract link on property page'); return; }
+
+      // Navigate to contract page
+      log(`  Following contract link for commission...`);
+      await page.goto(contractUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await delay(5000);
+
+      // Extract full contract data
+      const contractData = await page.evaluate(() => {
+        const text = document.body?.textContent || '';
+        const result = {};
+
+        // Commission percentage and seasons
+        // Pattern: "from Jan 01 to the Dec 31 20.00% of rental amount"
+        // or "del 01 ene al 31 dic 20,00% del importe del alquiler"
+        const seasonMatches = text.match(/(?:from|del)\s+(.+?)\s+(\d{1,3}[.,]\d{1,2})\s*%\s*(?:of rental|del (?:importe|alquiler))/gi);
+        if (seasonMatches) {
+          result.commission_seasons = seasonMatches.map(m => {
+            const parts = m.match(/(?:from|del)\s+(.+?)\s+(\d{1,3}[.,]\d{1,2})\s*%/i);
+            return parts ? { period: parts[1].trim(), percent: parseFloat(parts[2].replace(',', '.')) } : null;
+          }).filter(Boolean);
+          if (result.commission_seasons.length > 0) {
+            result.commission_percent = result.commission_seasons[0].percent;
+          }
+        }
+
+        // Fallback: any commission percentage
+        if (!result.commission_percent) {
+          const fallback = text.match(/(\d{1,3}[.,]\d{1,2})\s*%\s*(?:of rental|del (?:importe|alquiler))/i);
+          if (fallback) result.commission_percent = parseFloat(fallback[1].replace(',', '.'));
+        }
+
+        // Deduct channel/agent commission
+        const deductMatch = text.match(/(?:Deduct|Descontar|Deducir)[^.]*?(?:commission|comisi[oó]n)[^.]*?\?\s*(Yes|No|S[ií])/i);
+        result.deduct_channel_commission = deductMatch ? deductMatch[1].toLowerCase() !== 'no' : null;
+
+        // Channel commission deduction percentage
+        const channelPctMatch = text.match(/(?:payment to the property owner|pago al propietario)[^)]*?(\d{1,3})\s*%/i);
+        result.channel_deduction_percent = channelPctMatch ? parseInt(channelPctMatch[1]) : null;
+
+        // Extras payable to owner — "¿Debemos abonarle los extras al propietario?" section
+        // Pattern: "Heating, 100.00 % (Tax set as extra)" or "Calefacción, 100,00 %"
+        // Only look within the extras-to-owner section, never fallback to whole document
+        const extrasSection = text.match(/(?:pay the extras|pagar los extras|abonar(?:le)? los extras)[^?]*\?\s*(.*?)(?:Should|¿Deb|Incluir|Include|Gastos|booking expense)/is);
+        if (extrasSection) {
+          const extrasText = extrasSection[1];
+          // Match: "• Heating, 100.00 %" or "• Calefacción, 100,00 %" or "Heating, 100.00 % (Tax set as extra)"
+          const extraMatches = [...extrasText.matchAll(/(?:[-•·]\s*)?([A-Za-zÁÉÍÓÚÑáéíóúñ][^,\n]{1,40}?),?\s*(\d{1,3}[.,]\d{1,2})\s*%/g)];
+          result.extras_to_owner = extraMatches.map(m => ({
+            service: m[1].trim(),
+            percent: parseFloat(m[2].replace(',', '.')),
+          })).filter(e => {
+            const s = e.service.toLowerCase();
+            // Skip commission season text and partial sentences
+            if (/^de \d/.test(s)) return false;                    // "De 01 ene al 31 dic"
+            if (/comisi[oó]n|commission/.test(s)) return false;    // commission description fragments
+            if (/^[a-záéíóúñ]/.test(e.service)) return false;      // starts lowercase = partial text
+            if (s.length < 3) return false;                        // too short
+            return true;
+          });
+        }
+
+        // Include booking expenses for owner
+        const expensesMatch = text.match(/(?:booking expense|gastos de reserva)[^?]*\?\s*(Yes|No|S[ií])/i);
+        result.include_booking_expenses = expensesMatch ? expensesMatch[1].toLowerCase() !== 'no' : null;
+
+        // Pay tourism fees to owner
+        const tourismMatch = text.match(/(?:tourism fees|tasas tur[ií]sticas)[^?]*\?\s*(Yes|No|S[ií])/i);
+        result.pay_tourism_fees = tourismMatch ? tourismMatch[1].toLowerCase() !== 'no' : null;
+
+        return result;
+      });
+
+      log(`  Contract data: ${JSON.stringify(contractData)}`);
+
+      // Find property in our DB
+      const propRes = await fetch(`${LARAVEL_API_BASE}/properties/by-avantio-id/${avantioPropertyId}`, {
+        headers: { 'Accept': 'application/json' },
+      });
+      const prop = propRes.ok ? await propRes.json() : null;
+
+      if (contractData.commission_percent && prop) {
+        await fetch(`${LARAVEL_API_BASE}/properties/${prop.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify({
+            hs_commission_percent: contractData.commission_percent,
+            contract_data: contractData,
+          }),
+        });
+        log(`  Saved contract: ${contractData.commission_percent}% commission`);
+
+        // Save extras_to_owner as property services with owner_return_percent
+        if (contractData.extras_to_owner && contractData.extras_to_owner.length > 0) {
+          for (const extra of contractData.extras_to_owner) {
+            await fetch(`${LARAVEL_API_BASE}/properties/${prop.id}/services`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({
+                name: extra.service,
+                owner_return_percent: extra.percent,
+                is_from_avantio: true,
+              }),
+            });
+          }
+          log(`  Saved ${contractData.extras_to_owner.length} extras with owner return %`);
+        }
+      } else if (!contractData.commission_percent) {
+        log(`  Could not extract commission from contract`);
+      }
+    } catch (e) {
+      log(`  Commission scrape error: ${e.message}`);
+    }
+  }
+
   async _saveBookingServices(avantioId, services) {
     try {
       // Find the booking ID from avantio_id
@@ -2256,7 +2670,8 @@ class AvantioScraper {
       const services = [];
       for (const table of document.querySelectorAll('table')) {
         const headerText = cleanCellText(table.querySelector('thead') || table.querySelector('tr') || table);
-        if (!headerText.includes('Concept') && !headerText.includes('Price')) continue;
+        if (!headerText.includes('Concept') && !headerText.includes('Concepto') &&
+            !headerText.includes('Price') && !headerText.includes('Precio')) continue;
 
         const rows = table.querySelectorAll('tbody tr, tr');
         for (const row of rows) {
@@ -2265,28 +2680,31 @@ class AvantioScraper {
           const cellTexts = Array.from(cells).map(c => cleanCellText(c));
 
           const concept = cellTexts[0];
-          if (!concept || concept === 'Concept' || concept.includes('Total') || concept.includes('TOTAL')) continue;
-          if (concept === 'Paid' || concept === 'Pending') continue;
+          if (!concept || concept === 'Concept' || concept === 'Concepto') continue;
+          if (concept.includes('Total') || concept.includes('TOTAL')) continue;
+          if (concept === 'Paid' || concept === 'Pending' || concept === 'Pagado' || concept === 'Pendiente') continue;
 
-          const isProperty = concept === 'Property' || concept === 'Propiedad';
+          const isProperty = concept === 'Property' || concept === 'Propiedad' || concept === 'Alojamiento';
           const isService = concept.startsWith('-') || concept.startsWith('–');
 
-          if (isProperty || isService) {
-            // Strip inline JS tooltips: "Final Cleaning $(function()..." → "Final Cleaning"
+          // Only import extras/services, skip property/accommodation row
+          if (isService) {
+            const clean = (s) => (s || '').replace(/\$\(function\(\).*$/, '').trim() || null;
             const cleanConcept = concept
               .replace(/^[-–]\s*/, '')
               .replace(/\s*\$\(function\(\).*$/, '')
-              .replace(/\s*[.…]{2,}\s*Price per unit:.*$/, '')
+              .replace(/\s*[.…]{2,}\s*(Price per unit|Precio por unidad|Precio unitario):.*$/, '')
               .replace(/\s*[.…]{2,}\s*$/, '')
               .trim();
+            // Columns: [0]=Concept, [1]=Precio base (unit price), [2]=Cantidad, [3]=Tasas, [4]=Precio IVA incluido (total), [5]=charge moment
             services.push({
-              category: isProperty ? 'property' : 'service',
+              category: 'service',
               concept: cleanConcept,
-              price_label: (cellTexts[1] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
-              quantity: (cellTexts[2] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
-              tax: (cellTexts[3] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
-              total: (cellTexts[4] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
-              charge_moment: (cellTexts[5] || '').replace(/\$\(function\(\).*$/, '').trim() || null,
+              price_label: clean(cellTexts[1]),     // Precio base / unit price
+              quantity: clean(cellTexts[2]),          // Cantidad
+              tax: clean(cellTexts[3]),               // Tasas
+              total: clean(cellTexts[4]),             // Precio IVA incluido (total price)
+              charge_moment: clean(cellTexts[5]),     // When charged
             });
           }
         }
