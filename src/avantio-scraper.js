@@ -394,15 +394,19 @@ class AvantioScraper {
 
   async _downloadAndParseCSV(wcSelector) {
     log('  Clicking More actions → CSV download...');
-    await this.page.evaluate((wcSel) => {
+    const btnLabels = await this.page.evaluate((wcSel) => {
       const wc = document.querySelector(wcSel);
-      if (!wc || !wc.shadowRoot) return;
+      if (!wc || !wc.shadowRoot) return `no wc: ${wcSel}`;
+      const labels = [];
       for (const btn of wc.shadowRoot.querySelectorAll('button')) {
         const t = btn.textContent.trim();
         const aria = btn.getAttribute('aria-label') || '';
-        if (t === 'More actions' || t === 'Más acciones' || aria === 'More actions' || aria === 'Más acciones') { btn.click(); return; }
+        if (t) labels.push(t + (aria ? ` [${aria}]` : ''));
+        if (t === 'More actions' || t === 'Más acciones' || aria === 'More actions' || aria === 'Más acciones') { btn.click(); return `clicked: ${t}`; }
       }
+      return `buttons found: ${labels.join(' | ')}`;
     }, wcSelector);
+    log(`  Button scan: ${btnLabels}`);
     await delay(2000);
 
     const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
@@ -514,7 +518,8 @@ class AvantioScraper {
       const menu = document.querySelector('avantio-menu');
       if (!menu || !menu.shadowRoot) return null;
       for (const a of menu.shadowRoot.querySelectorAll('a'))
-        if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) return a.href;
+        const t = a.textContent.trim();
+        if ((t === 'Bookings' || t === 'Reservas') && a.href.includes('action=index')) return a.href;
       return null;
     });
     if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -524,19 +529,19 @@ class AvantioScraper {
     if (rows.length === 0) { log('  No CSV data. Falling back to scraping...'); return this.importBookings(); }
 
     const records = rows.map(r => ({
-      avantio_id: r['Booking number'] || `csv-${Date.now()}`,
-      avantio_reference: r['Booking number'],
-      check_in: this._parseCSVDate(r['Check-in date']),
-      check_out: this._parseCSVDate(r['Check-out date']),
-      nights: parseInt(r['nights']) || null,
-      total_amount: parseFloat(r['Booking total with tax']) || 0,
-      adults: parseInt(r['Adults']) || null,
-      children: parseInt(r['Children']) || null,
-      status: (r['Status'] || '').toLowerCase().replace(/ /g, '_'),
-      channel: r['Portal / Agent'] || null,
+      avantio_id: r['Booking number'] || r['Número de reserva'] || `csv-${Date.now()}`,
+      avantio_reference: r['Booking number'] || r['Número de reserva'],
+      check_in: this._parseCSVDate(r['Check-in date'] || r['Fecha de entrada']),
+      check_out: this._parseCSVDate(r['Check-out date'] || r['Fecha de salida']),
+      nights: parseInt(r['nights'] || r['Noches']) || null,
+      total_amount: parseFloat((r['Booking total with tax'] || r['Total reserva con impuestos'] || '0').replace(/\./g, '').replace(',', '.')) || 0,
+      adults: parseInt(r['Adults'] || r['Adultos']) || null,
+      children: parseInt(r['Children'] || r['Niños']) || null,
+      status: (r['Status'] || r['Estado'] || '').toLowerCase().replace(/ /g, '_'),
+      channel: r['Portal / Agent'] || r['Portal / Agente'] || null,
       currency: 'USD',
-      is_revenue: !['not_available', 'owner_booking'].includes((r['Status'] || '').toLowerCase().replace(/ /g, '_')),
-      property_avantio_id: r['Property ID'] || null,
+      is_revenue: !['not_available', 'owner_booking', 'no_disponible', 'reserva_propietario'].includes((r['Status'] || r['Estado'] || '').toLowerCase().replace(/ /g, '_')),
+      property_avantio_id: r['Property ID'] || r['ID propiedad'] || null,
       _csv: r,
     }));
 
@@ -2159,7 +2164,8 @@ class AvantioScraper {
         const menu = document.querySelector('avantio-menu');
         if (!menu || !menu.shadowRoot) return null;
         for (const a of menu.shadowRoot.querySelectorAll('a'))
-          if (a.textContent.trim() === 'Bookings' && a.href.includes('action=index')) return a.href;
+          const t = a.textContent.trim();
+        if ((t === 'Bookings' || t === 'Reservas') && a.href.includes('action=index')) return a.href;
         return null;
       });
       if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
