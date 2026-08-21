@@ -544,22 +544,31 @@ class AvantioScraper {
     const rows = await this._downloadAndParseCSV('avantio-bookings-list');
     if (rows.length === 0) { log('  No CSV data. Falling back to scraping...'); return this.importBookings(); }
 
-    const records = rows.map(r => ({
-      avantio_id: r['Booking number'] || r['Número de reserva'] || `csv-${Date.now()}`,
-      avantio_reference: r['Booking number'] || r['Número de reserva'],
-      check_in: this._parseCSVDate(r['Check-in date'] || r['Fecha de entrada']),
-      check_out: this._parseCSVDate(r['Check-out date'] || r['Fecha de salida']),
-      nights: parseInt(r['nights'] || r['Noches']) || null,
-      total_amount: parseFloat((r['Booking total with tax'] || r['Total reserva con impuestos'] || '0').replace(/\./g, '').replace(',', '.')) || 0,
-      adults: parseInt(r['Adults'] || r['Adultos']) || null,
-      children: parseInt(r['Children'] || r['Niños']) || null,
-      status: (r['Status'] || r['Estado'] || '').toLowerCase().replace(/ /g, '_'),
-      channel: r['Portal / Agent'] || r['Portal / Agente'] || null,
-      currency: 'USD',
-      is_revenue: !['not_available', 'owner_booking', 'no_disponible', 'reserva_propietario'].includes((r['Status'] || r['Estado'] || '').toLowerCase().replace(/ /g, '_')),
-      property_avantio_id: r['Property ID'] || r['ID propiedad'] || null,
-      _csv: r,
-    }));
+    // Log first row columns for debugging
+    if (rows.length > 0) log(`  CSV columns: ${Object.keys(rows[0]).join(', ')}`);
+
+    const records = rows.map(r => {
+      // Support both EN and ES column names
+      const bookingRef = r['Booking number'] || r['Localizador'] || '';
+      const status = (r['Status'] || r['Estado'] || '').toLowerCase().replace(/ /g, '_');
+      return {
+        avantio_id: bookingRef || `csv-${Date.now()}`,
+        avantio_reference: bookingRef,
+        check_in: this._parseCSVDate(r['Check-in date'] || r['Fecha entrada']),
+        check_out: this._parseCSVDate(r['Check-out date'] || r['Fecha salida']),
+        nights: parseInt(r['nights'] || r['noches']) || null,
+        total_amount: parseFloat((r['Booking total with tax'] || r['Total reserva con tasas'] || '0').toString().replace(/\./g, '').replace(',', '.')) || 0,
+        adults: parseInt(r['Adults'] || r['Adultos']) || null,
+        children: parseInt(r['Children'] || r['Niños']) || null,
+        status: status,
+        channel: r['Portal / Agent'] || r['Portal'] || null,
+        currency: 'USD',
+        is_revenue: !['not_available', 'owner_booking', 'no_disponible', 'reserva_propietario'].includes(status),
+        property_avantio_id: r['Property ID'] || r['id alojamiento'] || null,
+        property_name: r['Property'] || r['Nombre alojamiento'] || null,
+        _csv: r,
+      };
+    });
 
     await this._postToLaravel('bookings', records);
     this.importResults.bookings = records.length;
