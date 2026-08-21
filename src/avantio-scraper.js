@@ -400,7 +400,7 @@ class AvantioScraper {
       for (const btn of wc.shadowRoot.querySelectorAll('button')) {
         const t = btn.textContent.trim();
         const aria = btn.getAttribute('aria-label') || '';
-        if (t === 'More actions' || aria === 'More actions') { btn.click(); return; }
+        if (t === 'More actions' || t === 'Más acciones' || aria === 'More actions' || aria === 'Más acciones') { btn.click(); return; }
       }
     }, wcSelector);
     await delay(2000);
@@ -412,7 +412,7 @@ class AvantioScraper {
       if (!wc || !wc.shadowRoot) return;
       for (const btn of wc.shadowRoot.querySelectorAll('button')) {
         const t = btn.textContent.trim();
-        if (t === 'Download CSV' || t === 'Export CSV' || t === 'Download csv') { btn.click(); return; }
+        if (t === 'Download CSV' || t === 'Export CSV' || t === 'Download csv' || t === 'Descargar CSV' || t === 'Exportar CSV') { btn.click(); return; }
       }
     }, wcSelector);
 
