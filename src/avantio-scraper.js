@@ -514,6 +514,7 @@ class AvantioScraper {
     log('=== Importing Bookings via CSV ===');
     this.status = 'importing';
 
+    // Navigate to bookings list — try menu link first, fallback to direct navigation
     const bookingsUrl = await this.page.evaluate(() => {
       const menu = document.querySelector('avantio-menu');
       if (!menu || !menu.shadowRoot) return null;
@@ -523,7 +524,12 @@ class AvantioScraper {
       }
       return null;
     });
-    if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (bookingsUrl) {
+      await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } else {
+      log('  Menu link not found, navigating directly to bookings...');
+      await this.navigateToModule('Compromisos', 'index');
+    }
     await delay(5000);
 
     const rows = await this._downloadAndParseCSV('avantio-bookings-list');
