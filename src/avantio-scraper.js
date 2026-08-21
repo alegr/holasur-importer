@@ -517,9 +517,10 @@ class AvantioScraper {
     const bookingsUrl = await this.page.evaluate(() => {
       const menu = document.querySelector('avantio-menu');
       if (!menu || !menu.shadowRoot) return null;
-      for (const a of menu.shadowRoot.querySelectorAll('a'))
+      for (const a of menu.shadowRoot.querySelectorAll('a')) {
         const t = a.textContent.trim();
         if ((t === 'Bookings' || t === 'Reservas') && a.href.includes('action=index')) return a.href;
+      }
       return null;
     });
     if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
