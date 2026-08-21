@@ -514,20 +514,29 @@ class AvantioScraper {
     log('=== Importing Bookings via CSV ===');
     this.status = 'importing';
 
-    // Navigate to bookings list — try menu link first, fallback to direct navigation
-    const bookingsUrl = await this.page.evaluate(() => {
-      const menu = document.querySelector('avantio-menu');
-      if (!menu || !menu.shadowRoot) return null;
-      for (const a of menu.shadowRoot.querySelectorAll('a')) {
-        const t = a.textContent.trim();
-        if ((t === 'Bookings' || t === 'Reservas') && a.href.includes('action=index')) return a.href;
-      }
-      return null;
-    });
+    // Navigate to bookings list — wait for menu to render, then click
+    log('  Waiting for sidebar menu to render...');
+    await delay(3000);
+    let bookingsUrl = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      bookingsUrl = await this.page.evaluate(() => {
+        const menu = document.querySelector('avantio-menu');
+        if (!menu || !menu.shadowRoot) return null;
+        for (const a of menu.shadowRoot.querySelectorAll('a')) {
+          const t = a.textContent.trim();
+          if ((t === 'Bookings' || t === 'Reservas') && a.href.includes('module=Compromisos')) return a.href;
+        }
+        return null;
+      });
+      if (bookingsUrl) break;
+      log(`  Menu not ready, retry ${attempt + 1}/5...`);
+      await delay(2000);
+    }
     if (bookingsUrl) {
+      log(`  Found bookings link, navigating...`);
       await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     } else {
-      log('  Menu link not found, navigating directly to bookings...');
+      log('  Menu link not found after retries, trying navigateToModule...');
       await this.navigateToModule('Compromisos', 'index');
     }
     await delay(5000);
