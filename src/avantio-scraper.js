@@ -7,7 +7,7 @@ const path = require('path');
 const LARAVEL_API = process.env.HOLASUR_API_URL || 'http://localhost:8001/api/import';
 const LARAVEL_API_BASE = process.env.HOLASUR_API_URL?.replace('/import', '') || 'http://localhost:8001/api';
 const AVANTIO_BASE = 'https://app.avantio.pro';
-const NAV_TIMEOUT = 60000; // 60s timeout for page navigation
+const NAV_TIMEOUT = 120000; // 120s timeout for page navigation
 const PAGE_SIZE = 30;
 
 // Rate limiting config
