@@ -46,8 +46,14 @@ app.get('/import/active', (req, res) => {
     const status = session.scraper.status !== 'initialized'
       ? session.scraper.status
       : session.status;
-    if (status === 'logged_in' || status === 'done') {
-      return res.json({ sessionId, status, active: true });
+    if (['waiting_for_login', 'needs_login', 'needs_2fa', 'logged_in', 'importing', 'done'].includes(status)) {
+      return res.json({
+        sessionId,
+        status,
+        active: true,
+        importResults: session.scraper.importResults || {},
+        entity: session.entity || null,
+      });
     }
   }
   res.json({ active: false });
@@ -270,6 +276,7 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     return res.json({ sessionId, entity, status: 'importing', message: 'Import already in progress.' });
   }
 
+  session.entity = entity;
   res.json({ sessionId, entity, status: 'importing' });
 
   try {
@@ -606,6 +613,7 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
     return res.json({ entity, status: 'importing', message: 'Detail scrape already in progress.' });
   }
 
+  session.entity = entity;
   try {
     session.scraper.status = 'importing';
     let detail;
