@@ -7,6 +7,7 @@ const path = require('path');
 const LARAVEL_API = process.env.HOLASUR_API_URL || 'http://localhost:8001/api/import';
 const LARAVEL_API_BASE = process.env.HOLASUR_API_URL?.replace('/import', '') || 'http://localhost:8001/api';
 const AVANTIO_BASE = 'https://app.avantio.pro';
+const NAV_TIMEOUT = 60000; // 60s timeout for page navigation
 const PAGE_SIZE = 30;
 
 // Rate limiting config
@@ -211,7 +212,7 @@ class AvantioScraper {
 
     if (tokenData && tokenData.fullUrl) {
       log(`Using full signed URL for ${key}`);
-      await this.page.goto(tokenData.fullUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await this.page.goto(tokenData.fullUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     } else {
       // Try clicking a matching href link
       log(`No cached avs for ${key}, attempting DOM link click...`);
@@ -246,7 +247,7 @@ class AvantioScraper {
           const anyToken = this.avsTokens.values().next().value;
           if (anyToken && anyToken.avs) {
             const constructedUrl = `${AVANTIO_BASE}/index.php?module=${encodeURIComponent(module)}&action=${encodeURIComponent(action)}&avs=${encodeURIComponent(anyToken.avs)}`;
-            await this.page.goto(constructedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await this.page.goto(constructedUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
             // Check if we got error 6019
             const resultUrl = this.page.url();
             if (resultUrl.includes('error=6019')) {
@@ -263,14 +264,14 @@ class AvantioScraper {
     const arrivedUrl = this.page.url();
     if (arrivedUrl.includes('error=6019')) {
       log(`Got error 6019, retrying via dashboard...`);
-      await this.page.goto(`${AVANTIO_BASE}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await this.page.goto(`${AVANTIO_BASE}`, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       await delay(5000);
       this.avsTokens.clear();
       await this.harvestAvs();
       // Try once more with fresh tokens
       const retryToken = this.avsTokens.get(key);
       if (retryToken && retryToken.fullUrl) {
-        await this.page.goto(retryToken.fullUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this.page.goto(retryToken.fullUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       }
     }
 
@@ -409,7 +410,7 @@ class AvantioScraper {
     log(`  Button scan: ${btnLabels}`);
     await delay(2000);
 
-    const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+    const downloadPromise = this.page.waitForEvent('download', { timeout: NAV_TIMEOUT });
 
     await this.page.evaluate((wcSel) => {
       const wc = document.querySelector(wcSel);
@@ -534,7 +535,7 @@ class AvantioScraper {
     }
     if (bookingsUrl) {
       log(`  Found bookings link, navigating...`);
-      await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     } else {
       log('  Menu link not found after retries, trying navigateToModule...');
       await this.navigateToModule('Compromisos', 'index');
@@ -978,7 +979,7 @@ class AvantioScraper {
     await delay(2000);
 
     // Set up download handler before clicking the Csv link
-    const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+    const downloadPromise = this.page.waitForEvent('download', { timeout: NAV_TIMEOUT });
 
     // Click the Csv link in the dropdown
     await this.page.evaluate(() => {
@@ -1161,7 +1162,7 @@ class AvantioScraper {
       return [];
     }
 
-    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    await detailPage.waitForLoadState('load', { timeout: NAV_TIMEOUT }).catch(() => {});
     log(`  On property detail: ${detailPage.url().substring(0, 80)}`);
     await delay(3000);
 
@@ -1463,7 +1464,7 @@ class AvantioScraper {
         if (a.textContent.trim() === 'List of outstanding payments receivable') return a.href;
       return null;
     });
-    if (url) await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (url) await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     await delay(5000);
 
     // This page uses avantio-pending-payments-list web component (like bookings)
@@ -1916,7 +1917,7 @@ class AvantioScraper {
     }
     if (!detailPage) { log(`  No detail tab for ${entityType} row ${rowIndex}`); return null; }
 
-    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    await detailPage.waitForLoadState('load', { timeout: NAV_TIMEOUT }).catch(() => {});
     log(`  Detail tab opened: ${detailPage.url().substring(0, 100)}`);
     // Wait for AJAX content to load (booking details load async)
     await delay(8000);
@@ -1969,7 +1970,7 @@ class AvantioScraper {
 
         // Make sure we're on an Avantio page (needed for fetch with session cookies)
         if (!this.page.url().includes('avantio.pro')) {
-          await this.page.goto(AVANTIO_BASE, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.page.goto(AVANTIO_BASE, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
           await delay(3000);
         }
 
@@ -1999,7 +2000,7 @@ class AvantioScraper {
           log(`  Found booking ${booking.id}: ${booking.propertyName}`);
           log(`  Navigating to detail page...`);
 
-          await this.page.goto(booking.routes.detail, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await this.page.goto(booking.routes.detail, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
           await delay(8000);
 
           if (!this.page.url().includes('error=')) {
@@ -2123,7 +2124,7 @@ class AvantioScraper {
           if (avsMatch) {
             const detailUrl = `${AVANTIO_BASE}/index.php?record=${recordId}&module=${module}&action=DetailView&avs=${avsMatch[1]}`;
             log(`  Direct navigation to detail: record=${recordId} (avs from template)`);
-            await this.page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await this.page.goto(detailUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => {});
             await delay(5000);
           }
         }
@@ -2194,7 +2195,7 @@ class AvantioScraper {
         }
         return null;
       });
-      if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      if (bookingsUrl) await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
     }
     await delay(3000);
 
@@ -2364,7 +2365,7 @@ class AvantioScraper {
       return null;
     }
 
-    await detailPage.waitForLoadState('load', { timeout: 30000 }).catch(() => {});
+    await detailPage.waitForLoadState('load', { timeout: NAV_TIMEOUT }).catch(() => {});
     log(`  Detail tab: ${detailPage.url().substring(0, 80)}`);
     await delay(5000);
 
@@ -2772,7 +2773,7 @@ class AvantioScraper {
         return null;
       });
       if (bookingsUrl) {
-        await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this.page.goto(bookingsUrl, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
       }
     }
 
