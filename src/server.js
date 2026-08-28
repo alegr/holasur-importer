@@ -12,7 +12,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
@@ -22,6 +22,107 @@ const AVANTIO_URL = 'https://app.avantio.pro';
 
 // Active sessions: sessionId -> { browser, context, page, scraper, status, createdAt }
 const sessions = new Map();
+
+// Server-side jobs Map: jobId -> { id, type, entity, avantioId, status, records, error, createdAt, startedAt, finishedAt }
+const jobs = new Map();
+let processingQueue = false;
+
+function createJob(type, entity, avantioId) {
+  const id = crypto.randomUUID();
+  const job = {
+    id,
+    type,
+    entity,
+    avantioId: avantioId || null,
+    status: 'queued',
+    records: 0,
+    error: null,
+    createdAt: Date.now(),
+    startedAt: null,
+    finishedAt: null,
+  };
+  jobs.set(id, job);
+  log(`[jobs] Created job ${id}: ${type} ${entity}${avantioId ? ':' + avantioId : ''}`);
+  return job;
+}
+
+const entityMethodMap = {
+  properties: (scraper) => scraper.importPropertiesCSV(),
+  bookings: (scraper) => scraper.importBookingsCSV(),
+  owners: (scraper) => scraper.importOwners(),
+  customers: (scraper) => scraper.importCustomers(),
+  tasks: (scraper) => scraper.importTasks(),
+  payments_received: (scraper) => scraper.importPaymentsReceived(),
+  payments_made: (scraper) => scraper.importPaymentsMade(),
+  payments_pending: (scraper) => scraper.importPaymentsToMake(),
+  payments_outstanding: (scraper) => scraper.importPaymentsOutstanding(),
+  invoices: (scraper) => scraper.importInvoices(),
+  service_catalog: (scraper) => scraper.importServiceCatalog(),
+};
+
+async function processQueue() {
+  if (processingQueue) return;
+  processingQueue = true;
+
+  while (true) {
+    // Find next queued job
+    let nextJob = null;
+    for (const [, j] of jobs) {
+      if (j.status === 'queued') { nextJob = j; break; }
+    }
+    if (!nextJob) break;
+
+    // Find an available session
+    let session = null;
+    for (const [, s] of sessions) {
+      const st = s.scraper?.status !== 'initialized' ? s.scraper.status : s.status;
+      if (['logged_in', 'done'].includes(st)) { session = s; break; }
+    }
+    if (!session) break; // no available session
+
+    // Reset done session
+    if (session.scraper.status === 'done') {
+      session.scraper.status = 'logged_in';
+      session.status = 'logged_in';
+      session.scraper.importResults = {};
+    }
+
+    nextJob.status = 'importing';
+    nextJob.startedAt = Date.now();
+    session.scraper.status = 'importing';
+    session.status = 'importing';
+    session.entity = nextJob.avantioId ? `${nextJob.entity}:${nextJob.avantioId}` : nextJob.entity;
+
+    log(`[jobs] Starting job ${nextJob.id}: ${nextJob.type} ${nextJob.entity}${nextJob.avantioId ? ':' + nextJob.avantioId : ''}`);
+
+    try {
+      if (nextJob.type === 'detail') {
+        const detail = await session.scraper.scrapeRecordDetail(nextJob.entity, nextJob.avantioId);
+        nextJob.records = detail ? 1 : 0;
+      } else {
+        const method = entityMethodMap[nextJob.entity];
+        if (method) await method(session.scraper);
+        // Count records from importResults
+        const total = Object.values(session.scraper.importResults || {}).reduce((a, b) => a + b, 0);
+        nextJob.records = total;
+      }
+      nextJob.status = 'done';
+      nextJob.finishedAt = Date.now();
+      session.scraper.status = 'done';
+      session.status = 'done';
+      log(`[jobs] Job done ${nextJob.id}: ${nextJob.type} ${nextJob.entity} (${nextJob.records} records)`);
+    } catch (err) {
+      nextJob.status = 'error';
+      nextJob.error = err.message;
+      nextJob.finishedAt = Date.now();
+      session.scraper.status = 'done';
+      session.status = 'done';
+      log(`[jobs] Job error ${nextJob.id}: ${nextJob.type} ${nextJob.entity} — ${err.message}`);
+    }
+  }
+
+  processingQueue = false;
+}
 
 // Auto-cleanup stale sessions every 60 seconds
 setInterval(async () => {
@@ -38,8 +139,88 @@ setInterval(async () => {
 }, 60_000);
 
 // ---------------------------------------------------------------------------
+// GET /import/jobs
+// Return all tracked jobs, sorted by createdAt ascending. Cleans up old done/error jobs.
+// ---------------------------------------------------------------------------
+app.get('/import/jobs', (req, res) => {
+  const now = Date.now();
+  const CLEANUP_AGE = 30 * 60 * 1000; // 30 minutes
+
+  // Update records from live scraper importResults for the active (importing) job
+  for (const [, j] of jobs) {
+    if (j.status === 'importing') {
+      for (const [, s] of sessions) {
+        if (s.scraper?.importResults) {
+          const total = Object.values(s.scraper.importResults).reduce((a, b) => a + b, 0);
+          if (total > 0) j.records = total;
+        }
+      }
+    }
+  }
+
+  // Clean up done/error jobs older than 30 minutes
+  for (const [id, j] of jobs) {
+    if ((j.status === 'done' || j.status === 'error') && j.finishedAt && (now - j.finishedAt > CLEANUP_AGE)) {
+      jobs.delete(id);
+    }
+  }
+
+  // Check if we have a logged-in session
+  let hasSession = false;
+  for (const [, s] of sessions) {
+    const st = s.scraper?.status !== 'initialized' ? s.scraper.status : s.status;
+    if (['logged_in', 'importing', 'done'].includes(st)) { hasSession = true; break; }
+  }
+
+  // Return copies — mark the first queued as waiting_for_login if no session (without mutating original)
+  const jobList = [...jobs.values()]
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map(j => ({ ...j }));
+  if (!hasSession) {
+    const firstQueued = jobList.find(j => j.status === 'queued');
+    if (firstQueued) firstQueued.status = 'waiting_for_login';
+  }
+
+  res.json(jobList);
+});
+
+// ---------------------------------------------------------------------------
+// POST /import/jobs
+// Create a queued job immediately (before login). processQueue picks it up.
+// ---------------------------------------------------------------------------
+app.post('/import/jobs', (req, res) => {
+  const { type, entity, avantioId } = req.body || {};
+  if (!type || !entity) {
+    return res.status(400).json({ error: 'type and entity required' });
+  }
+  // Dedup: don't create if same entity+avantioId is already queued or importing
+  for (const [, j] of jobs) {
+    if (j.entity === entity && j.avantioId === (avantioId || null) && ['queued', 'importing'].includes(j.status)) {
+      log(`[jobs] Dedup: ${entity}${avantioId ? ':' + avantioId : ''} already ${j.status}`);
+      return res.json(j);
+    }
+  }
+  const job = createJob(type, entity, avantioId || null);
+  log(`[jobs] Created job ${job.id}: ${type} ${entity}${avantioId ? ':' + avantioId : ''}`);
+  processQueue();
+  res.json(job);
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /import/jobs/:jobId
+// Dismiss a completed job from the list.
+// ---------------------------------------------------------------------------
+app.delete('/import/jobs/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = jobs.get(jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found.' });
+  jobs.delete(jobId);
+  res.json({ dismissed: true, jobId });
+});
+
+// ---------------------------------------------------------------------------
 // GET /import/active
-// Return the current active session if one exists and is usable.
+// Return the current active session if one exists and is usable (backward compat).
 // ---------------------------------------------------------------------------
 app.get('/import/active', (req, res) => {
   for (const [sessionId, session] of sessions) {
@@ -68,7 +249,25 @@ app.post('/import/start', async (req, res) => {
     const sessionId = crypto.randomUUID();
     log(`[${sessionId}] Launching browser...`);
 
-    // Close any existing sessions first — only one browser at a time
+    // Reuse existing session if it's importing or logged in
+    for (const [oldId, oldSession] of sessions) {
+      const oldStatus = oldSession.scraper?.status !== 'initialized'
+        ? oldSession.scraper.status
+        : oldSession.status;
+      if (['importing', 'logged_in', 'done'].includes(oldStatus)) {
+        // Reset done status so the new import doesn't see stale data
+        if (oldStatus === 'done') {
+          oldSession.scraper.status = 'logged_in';
+          oldSession.status = 'logged_in';
+          oldSession.entity = null;
+          oldSession.scraper.importResults = {};
+        }
+        log(`[${oldId}] Reusing session (was: ${oldStatus}).`);
+        return res.json({ sessionId: oldId, status: 'logged_in', reused: true });
+      }
+    }
+
+    // Close any existing idle sessions — only one browser at a time
     for (const [oldId, oldSession] of sessions) {
       try {
         log(`[${oldId}] Closing previous session...`);
@@ -154,6 +353,8 @@ app.post('/import/start', async (req, res) => {
       // AVS token harvesting is done within each import method.
       log(`[${sessionId}] Login detected by waitForLogin, setting status.`);
       session.status = 'logged_in';
+      // Process any queued jobs now that we have a session
+      processQueue();
     });
   } catch (err) {
     log(`Error starting session: ${err.message}`);
@@ -253,45 +454,14 @@ app.post('/import/:sessionId/import/:entity', async (req, res) => {
     });
   }
 
-  const methods = {
-    properties: () => session.scraper.importPropertiesCSV(),
-    bookings: () => session.scraper.importBookingsCSV(),
-    owners: () => session.scraper.importOwners(),
-    customers: () => session.scraper.importCustomers(),
-    tasks: () => session.scraper.importTasks(),
-    payments_received: () => session.scraper.importPaymentsReceived(),
-    payments_made: () => session.scraper.importPaymentsMade(),
-    payments_pending: () => session.scraper.importPaymentsToMake(),
-    payments_outstanding: () => session.scraper.importPaymentsOutstanding(),
-    invoices: () => session.scraper.importInvoices(),
-    service_catalog: () => session.scraper.importServiceCatalog(),
-  };
-
-  if (!methods[entity]) {
+  if (!entityMethodMap[entity]) {
     return res.status(400).json({ error: `Unknown entity: ${entity}` });
   }
 
-  // Prevent double-triggering — if already importing, just return current status
-  if (session.scraper.status === 'importing') {
-    return res.json({ sessionId, entity, status: 'importing', message: 'Import already in progress.' });
-  }
-
-  session.entity = entity;
-  res.json({ sessionId, entity, status: 'importing' });
-
-  try {
-    session.status = 'importing';
-    session.scraper.status = 'importing';
-    await methods[entity]();
-    session.status = 'done';
-    session.scraper.status = 'done';
-    log(`[${sessionId}] ${entity} import finished.`);
-    // Don't auto-close — session stays available for more imports
-  } catch (err) {
-    session.status = 'error';
-    session.error = err.message;
-    log(`[${sessionId}] ${entity} import error: ${err.message}`);
-  }
+  // Always create a server-side job and process via queue
+  const job = createJob('bulk', entity);
+  res.json({ sessionId, entity, status: 'queued', jobId: job.id, message: 'Job created.' });
+  processQueue();
 });
 
 // ---------------------------------------------------------------------------
@@ -608,32 +778,10 @@ app.post('/import/:sessionId/detail/:entity', async (req, res) => {
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
 
-  // Prevent double-triggering
-  if (session.scraper.status === 'importing') {
-    return res.json({ entity, status: 'importing', message: 'Detail scrape already in progress.' });
-  }
-
-  session.entity = entity;
-  try {
-    session.scraper.status = 'importing';
-    let detail;
-    if (avantioId) {
-      detail = await session.scraper.scrapeRecordDetail(entity, avantioId);
-    } else {
-      detail = await session.scraper.importOneDetail(entity);
-    }
-    res.json({ entity, detail, status: detail ? 'done' : 'no_data' });
-    // Auto-close browser after detail scrape (wait longer for services to save)
-    if (detail) {
-      setTimeout(async () => {
-        try { await session.browser.close(); } catch {}
-        sessions.delete(sessionId);
-        log(`[${sessionId}] Browser closed after detail scrape.`);
-      }, 10000);
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  // Always create a server-side job and process via queue
+  const job = createJob('detail', entity, avantioId);
+  res.json({ entity, status: 'queued', jobId: job.id, message: 'Job created.' });
+  processQueue();
 });
 
 // ---------------------------------------------------------------------------
